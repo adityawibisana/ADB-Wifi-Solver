@@ -7,6 +7,10 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// How long a command may take when it has to start the adb server first.
+/// Starting one takes a few seconds; a running one answers at once.
+pub const COLD_START: Duration = Duration::from_secs(15);
+
 /// Receives each adb command line and its output, for the log view.
 pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -171,6 +175,7 @@ impl Adb {
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 log(format!("  {line}"));
             }
+            log(format!("  ({} ms)", start.elapsed().as_millis()));
         }
         Ok(Output { success: status.success(), text })
     }
@@ -188,7 +193,11 @@ impl Adb {
     }
 
     pub fn devices(&self) -> Result<Vec<Device>, String> {
-        Ok(parse_devices(&self.run(&["devices", "-l"], Duration::from_secs(5))?.text))
+        self.devices_within(Duration::from_secs(5))
+    }
+
+    pub fn devices_within(&self, timeout: Duration) -> Result<Vec<Device>, String> {
+        Ok(parse_devices(&self.run(&["devices", "-l"], timeout)?.text))
     }
 
     /// Restarts a hung adb server. Tries `adb kill-server` first; a hung

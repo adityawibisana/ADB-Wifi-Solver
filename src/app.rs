@@ -69,11 +69,15 @@ pub struct App {
     timeout_secs: u64,
     session: Option<Session>,
     show_log: bool,
+    /// Startup timings already written to the log.
+    first_frame: bool,
+    qr_shown: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        let window_ms = crate::ms_since_launch();
         let shared = Arc::new(Shared {
             ctx: cc.egui_ctx.clone(),
             log: Mutex::default(),
@@ -86,6 +90,7 @@ impl App {
             restarted: AtomicBool::new(false),
             restart_notice: Mutex::default(),
         });
+        shared.log(format!("startup: window created ({window_ms} ms)"));
         spawn_device_poller(shared.clone());
 
         let mut app = App {
@@ -96,8 +101,11 @@ impl App {
             timeout_secs: 120,
             session: None,
             show_log: false,
+            first_frame: false,
+            qr_shown: false,
         };
         app.set_adb(None);
+        app.shared.log(format!("startup: adb located ({} ms)", crate::ms_since_launch()));
         // Show a QR code right away; most of the time that's why the app was opened.
         app.start_pairing();
         app
@@ -302,16 +310,21 @@ impl App {
         let mut cancel = false;
         let mut again = false;
         {
-            let p = session.progress.lock().unwrap();
+            let progress = session.progress.clone();
+            let p = progress.lock().unwrap();
             if let Some(matrix) = &p.qr {
                 let side = ui.available_width().min(ui.available_height() - 90.0).clamp(160.0, 380.0);
                 draw_qr(ui, matrix, side);
+                if !self.qr_shown {
+                    self.qr_shown = true;
+                    self.shared.log(format!("startup: QR code shown ({} ms)", crate::ms_since_launch()));
+                }
                 ui.add_space(6.0);
-                let left = p.deadline.map_or(0, |d| d.saturating_duration_since(Instant::now()).as_secs());
-                ui.label(format!(
-                    "Attempt {}/{MAX_ATTEMPTS} · QR code expires in {left}s",
-                    p.attempt
-                ));
+                // No countdown until adb is up and looking for the phone.
+                let expiry = p.deadline.map_or(String::new(), |d| {
+                    format!(" · QR code expires in {}s", d.saturating_duration_since(Instant::now()).as_secs())
+                });
+                ui.label(format!("Attempt {}/{MAX_ATTEMPTS}{expiry}", p.attempt));
             }
             match &p.outcome {
                 None => {
@@ -501,6 +514,10 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.first_frame {
+            self.first_frame = true;
+            self.shared.log(format!("startup: first frame ({} ms)", crate::ms_since_launch()));
+        }
         // After a restart the old pairing session was talking to the dead
         // server; start over unless it already connected a phone.
         if self.shared.restarted.swap(false, Ordering::Relaxed) {
@@ -578,10 +595,18 @@ fn disconnect_tooltip(serial: &str) -> &'static str {
 
 /// Refreshes the device list every couple of seconds, or right away on request.
 fn spawn_device_poller(shared: Arc<Shared>) {
+    // The adb that has answered at least once. Until then the server may be
+    // starting, which takes seconds, so a short timeout would wrongly call it hung.
+    let mut answered: Option<PathBuf> = None;
     thread::spawn(move || loop {
         let adb = shared.adb.lock().unwrap().clone();
         if let Some(adb) = adb {
-            let result = adb.devices();
+            let warm = answered.as_deref() == Some(adb.path());
+            let result = adb.devices_within(if warm { Duration::from_secs(5) } else { adb::COLD_START });
+            if result.is_ok() && !warm {
+                answered = Some(adb.path().to_path_buf());
+                shared.log(format!("startup: device list loaded ({} ms)", crate::ms_since_launch()));
+            }
             // No point asking a server that just failed to answer.
             let services = if result.is_ok() { adb.mdns_services().unwrap_or_default() } else { Vec::new() };
             let mut list = shared.devices.lock().unwrap();

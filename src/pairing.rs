@@ -106,30 +106,6 @@ impl Worker {
     }
 
     fn run(&self) -> Result<String, String> {
-        self.status("Starting adb...");
-        // Starting a server takes a few seconds; a running one answers at
-        // once. Waiting longer only delays telling the user it is hung.
-        let started = self.adb.run(&["start-server"], Duration::from_secs(15)).map_err(|e| {
-            if adb::is_timeout(&e) {
-                SERVER_HUNG.to_string()
-            } else {
-                e
-            }
-        })?;
-        if !started.success {
-            return Err(format!("adb start-server failed: {}", started.text.trim()));
-        }
-        match self.adb.run(&["mdns", "check"], Duration::from_secs(10)) {
-            Ok(out) if out.text.contains("mdns daemon version") => {}
-            _ => self.update(|p| {
-                p.warning = Some(
-                    "adb reports mDNS is unavailable, so the phone may not be found. \
-                     Update platform-tools to version 34 or newer."
-                        .into(),
-                )
-            }),
-        }
-
         let (phone_ip, guid) = self.pair()?;
         let serial = self.connect(&phone_ip, guid.as_deref())?;
 
@@ -141,6 +117,37 @@ impl Worker {
         Ok(if model.is_empty() { serial } else { format!("{model} ({serial})") })
     }
 
+    fn start_server(&self) -> Result<(), String> {
+        self.status("Starting adb...");
+        // Waiting longer than a cold start only delays telling the user it is hung.
+        let started = self.adb.run(&["start-server"], adb::COLD_START).map_err(|e| {
+            if adb::is_timeout(&e) {
+                SERVER_HUNG.to_string()
+            } else {
+                e
+            }
+        })?;
+        if !started.success {
+            return Err(format!("adb start-server failed: {}", started.text.trim()));
+        }
+        Ok(())
+    }
+
+    /// Warns if adb has no mDNS, since then the phone is never found. Only a
+    /// warning, so it runs after the QR code is up rather than before.
+    fn check_mdns(&self) {
+        match self.adb.run(&["mdns", "check"], Duration::from_secs(10)) {
+            Ok(out) if out.text.contains("mdns daemon version") => {}
+            _ => self.update(|p| {
+                p.warning = Some(
+                    "adb reports mDNS is unavailable, so the phone may not be found. \
+                     Update platform-tools to version 34 or newer."
+                        .into(),
+                )
+            }),
+        }
+    }
+
     /// Shows QR codes until one pairs, then returns the phone's IP and guid.
     fn pair(&self) -> Result<(String, Option<String>), String> {
         let mut last_error = String::new();
@@ -148,14 +155,18 @@ impl Worker {
             let name = format!("adbqr-{}", random_alnum(8));
             let password = random_alnum(10);
             let matrix = qr::encode(&qr::pairing_payload(&name, &password))?;
+            // The QR code needs nothing from adb, so show it before the
+            // server is up; a cold server start takes a few seconds.
             self.update(|p| {
                 p.qr = Some(matrix);
                 p.attempt = attempt;
-                p.deadline = Some(Instant::now() + self.timeout);
-                p.status = "Waiting for the phone to scan the QR code...".into();
+                p.deadline = None;
             });
+            if attempt == 1 {
+                self.start_server()?;
+            }
 
-            let addr = self.wait_for_pairing_service(&name)?;
+            let addr = self.wait_for_pairing_service(&name, attempt == 1)?;
             let ip = adb::host_of(&addr).to_string();
             self.update(|p| {
                 p.qr = None;
@@ -178,9 +189,15 @@ impl Worker {
     }
 
     /// Polls mDNS for the pairing service the phone advertises after the scan.
-    fn wait_for_pairing_service(&self, name: &str) -> Result<String, String> {
+    /// The QR code's countdown starts here, once adb is up to see the phone.
+    fn wait_for_pairing_service(&self, name: &str, check_mdns: bool) -> Result<String, String> {
         let start = Instant::now();
+        self.update(|p| {
+            p.deadline = Some(start + self.timeout);
+            p.status = "Waiting for the phone to scan the QR code...".into();
+        });
         let mut hinted = false;
+        let mut mdns_checked = !check_mdns;
         loop {
             self.check_cancel()?;
             if let Ok(services) = self.adb.quiet().mdns_services() {
@@ -190,6 +207,10 @@ impl Worker {
                 {
                     return Ok(s.addr.clone());
                 }
+            }
+            if !mdns_checked {
+                mdns_checked = true;
+                self.check_mdns();
             }
             let elapsed = start.elapsed();
             if !hinted && elapsed > FIREWALL_HINT_AFTER {
