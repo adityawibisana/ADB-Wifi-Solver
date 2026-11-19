@@ -13,6 +13,9 @@ categories = ["command-line-utilities", "development-tools"]
 qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
 
+[build-dependencies]
+embed-resource = "3"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
 
