@@ -2,49 +2,31 @@
 
 Android Studio is somehow.... Sometimes works, sometimes doesn't work at all. So, this will fix that "sometimes". At least on my machine.
 
-`adbqr` shows a pairing QR code right in your terminal. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed.
+`adbqr` is a small desktop app that shows a pairing QR code. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed. It also lists the devices connected over Wi-Fi and lets you disconnect them.
 
-![adbqr showing a pairing QR code in the terminal](docs/qr.png)
+![adbqr showing a pairing QR code and the list of Wi-Fi devices](docs/app.png)
 
 ## Usage
 
-On the phone: **Developer options > Wireless debugging > Pair device with QR code**, then run:
+1. On the phone: **Developer options > Wireless debugging > Pair device with QR code**.
+2. Open adbqr. A QR code is shown right away.
+3. Scan it. adbqr pairs, connects, and shows `Connected: Pixel 8 (192.168.1.20:37891)`.
 
-```
-adbqr
-```
+Each QR code is valid for the scan timeout (120 seconds by default; change it before showing a new code). If pairing fails, a new QR code is generated and tried again, 3 attempts in total. When a code expires, click **Show new QR code**:
 
-Scan the QR code. When it's done you'll see something like:
+![The QR code expired, with a Show new QR code button](docs/expired.png)
 
-```
-Paired.
-Connecting to 192.168.1.20:37891...
+### Disconnecting Wi-Fi devices
 
-Connected: 192.168.1.20:37891 (Pixel 8)
-```
+The **Wi-Fi devices** panel lists every device adb is connected to over Wi-Fi and refreshes every 2 seconds. USB devices and emulators are not listed. **Disconnect** ends a device's connection, and **Disconnect all** does it for every listed device.
 
-If a scan fails, it makes a new QR code and tries again (3 attempts in total).
+- Devices listed by address (`192.168.1.20:37891`) are disconnected with `adb disconnect`.
+- Devices listed by mDNS name (`adb-XXXX._adb-tls-connect._tcp`) can't be disconnected that way: `adb disconnect` only takes an address, and adb reconnects paired phones it finds on the network by itself. For these, adbqr turns off **Wireless debugging** on the phone, which drops the connection and keeps it dropped. Turn it back on in Developer options to reconnect; the pairing is kept.
 
-### Options
+### Other controls
 
-![adbqr --help output](docs/help.png)
-
-<details>
-<summary>Options as text</summary>
-
-```
---timeout <sec>  Seconds to wait for the phone to scan each QR code (default 120)
---adb <path>     Path to adb or its folder (default: PATH, then the Android SDK)
---keep-open      Wait for Enter before exiting (handy when double-clicking the .exe)
---invert         Invert the QR colors (only with --no-color on a light terminal)
---no-color       Don't force white-on-black colors with ANSI escapes
---verbose        Print every adb command and its output
--h, --help       Show help
-```
-
-</details>
-
-Exit codes: `0` connected, `1` adb not found, `2` timeout, `3` pairing failed, `4` connect failed, `5` bad arguments, `6` other error.
+- **adb** (top bar): the adb that's in use. Click **Change** to point at a different `adb` or platform-tools folder.
+- **Show adb log** (bottom): every adb command adbqr ran and what it printed. Useful when something goes wrong.
 
 ## Requirements
 
@@ -54,7 +36,7 @@ Exit codes: `0` connected, `1` adb not found, `2` timeout, `3` pairing failed, `
 
 ## Install
 
-**Windows:** download [`adbqr.exe`](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest/download/adbqr.exe) from the [latest release](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest). It's a single file with nothing to install. Run it from a terminal, or double-click it and add `--keep-open` through a shortcut so the window stays open.
+**Windows:** download [`adbqr.exe`](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest/download/adbqr.exe) from the [latest release](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest). It's a single file with nothing to install; double-click to run.
 
 **Any platform**, with [Rust](https://rustup.rs) installed:
 
@@ -70,14 +52,14 @@ cd ADB-Wifi-Solver
 cargo build --release
 ```
 
-The binary ends up in `target/release/adbqr` (`adbqr.exe` on Windows). On Windows the C runtime is linked statically, so the .exe runs on its own.
+The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). On Windows the C runtime is linked statically, so the .exe runs on its own. On Linux, building needs the usual X11/Wayland development packages (for example `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libgl1-mesa-dev`).
 
 ## Troubleshooting
 
 - **Nothing happens after scanning.** Pairing is found over mDNS (UDP 5353). Make sure your firewall allows adb on this network. On Windows, the network should be set to *Private*.
-- **The QR code won't scan.** Make the terminal window bigger so the whole code fits. On a light terminal theme, try `--no-color --invert`.
 - **"mDNS is unavailable" warning.** Update platform-tools.
-- **Something else.** Run with `--verbose` to see every adb command and what it printed.
+- **A disconnected phone comes back.** For phones listed by mDNS name, Disconnect turns off Wireless debugging; if it's turned back on, adb reconnects. Check the adb log for what happened.
+- **Something else.** Open **Show adb log** to see every adb command and what it printed.
 
 ## How it works
 
@@ -85,6 +67,8 @@ The binary ends up in `target/release/adbqr` (`adbqr.exe` on Windows). On Window
 2. After the scan, the phone advertises an `_adb-tls-pairing` mDNS service under that name. adbqr waits for it to appear in `adb mdns services`.
 3. Runs `adb pair <addr> <password>`.
 4. Waits for the phone's `_adb-tls-connect` service and runs `adb connect` if adb doesn't connect on its own.
+
+The window is built with [egui](https://github.com/emilk/egui).
 
 ## License
 

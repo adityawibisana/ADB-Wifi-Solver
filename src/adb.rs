@@ -1,14 +1,19 @@
 use std::env;
 use std::io::Read;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Receives each adb command line and its output, for the log view.
+pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct Adb {
     path: PathBuf,
-    verbose: bool,
+    log: Option<Logger>,
 }
 
 pub struct Output {
@@ -23,10 +28,31 @@ pub struct MdnsService {
     pub addr: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     pub serial: String,
     pub state: String,
+    /// From `adb devices -l`, with underscores turned back into spaces.
+    pub model: Option<String>,
+}
+
+impl Device {
+    /// Connected over Wi-Fi: an `ip:port` serial or an mDNS service name.
+    pub fn is_wireless(&self) -> bool {
+        is_mdns_serial(&self.serial) || is_ip_port(&self.serial)
+    }
+}
+
+/// Serials adb gives devices it connected to through mDNS.
+pub fn is_mdns_serial(serial: &str) -> bool {
+    serial.contains("._adb-tls-connect._tcp")
+}
+
+fn is_ip_port(serial: &str) -> bool {
+    serial.rsplit_once(':').is_some_and(|(host, port)| {
+        port.parse::<u16>().is_ok()
+            && host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok()
+    })
 }
 
 /// The adb executable's file name on this platform (`adb.exe` on Windows).
@@ -69,14 +95,19 @@ pub fn locate(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
     candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
         "adb not found. Install Android SDK platform-tools and add it to PATH, \
-         set ANDROID_HOME, or pass --adb <path>."
+         set ANDROID_HOME, or enter the path to adb."
             .to_string()
     })
 }
 
 impl Adb {
-    pub fn new(path: PathBuf, verbose: bool) -> Self {
-        Adb { path, verbose }
+    pub fn new(path: PathBuf, log: Option<Logger>) -> Self {
+        Adb { path, log }
+    }
+
+    /// The same adb without logging, for background polling.
+    pub fn quiet(&self) -> Self {
+        Adb { path: self.path.clone(), log: None }
     }
 
     pub fn path(&self) -> &Path {
@@ -85,10 +116,18 @@ impl Adb {
 
     /// Runs adb with a timeout and returns its combined stdout and stderr.
     pub fn run(&self, args: &[&str], timeout: Duration) -> Result<Output, String> {
-        if self.verbose {
-            println!("> adb {}", args.join(" "));
+        if let Some(log) = &self.log {
+            log(format!("> adb {}", args.join(" ")));
         }
-        let mut child = Command::new(&self.path)
+        let mut command = Command::new(&self.path);
+        #[cfg(windows)]
+        {
+            // Don't flash a console window for every adb call.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -134,9 +173,9 @@ impl Adb {
         while let Ok(part) = rx.recv_timeout(Duration::from_secs(1)) {
             text.push_str(&part);
         }
-        if self.verbose {
-            for line in text.lines() {
-                println!("  {line}");
+        if let Some(log) = &self.log {
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                log(format!("  {line}"));
             }
         }
         Ok(Output { success: status.success(), text })
@@ -147,7 +186,47 @@ impl Adb {
     }
 
     pub fn devices(&self) -> Result<Vec<Device>, String> {
-        Ok(parse_devices(&self.run(&["devices"], Duration::from_secs(10))?.text))
+        Ok(parse_devices(&self.run(&["devices", "-l"], Duration::from_secs(10))?.text))
+    }
+
+    /// Ends a Wi-Fi connection and returns a message describing what was done.
+    ///
+    /// `adb disconnect` only accepts `ip:port`, and the adb server reconnects
+    /// paired phones it sees over mDNS by itself. So for mDNS serials this
+    /// turns off Wireless debugging on the phone instead, which drops the
+    /// connection and keeps it dropped until it is turned back on.
+    pub fn disconnect(&self, serial: &str) -> Result<String, String> {
+        if !is_mdns_serial(serial) {
+            let out = self.run(&["disconnect", serial], Duration::from_secs(10))?;
+            return if out.success && out.text.contains("disconnected") {
+                Ok(format!("Disconnected {serial}"))
+            } else {
+                Err(out.text.trim().to_string())
+            };
+        }
+
+        let result = self.run(
+            &["-s", serial, "shell", "settings", "put", "global", "adb_wifi_enabled", "0"],
+            Duration::from_secs(10),
+        );
+        // The phone can drop the connection before the command reports back,
+        // so judge by whether the device actually goes away.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            match self.quiet().devices() {
+                Ok(devices) if !devices.iter().any(|d| d.serial == serial) => {
+                    return Ok(format!("Turned off Wireless debugging on {serial}"));
+                }
+                _ => thread::sleep(Duration::from_millis(300)),
+            }
+        }
+        match result {
+            Ok(out) if out.success => Ok(format!(
+                "Turned off Wireless debugging on {serial}; adb may list it for a few more seconds"
+            )),
+            Ok(out) => Err(out.text.trim().to_string()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -173,16 +252,16 @@ pub fn parse_mdns_services(text: &str) -> Vec<MdnsService> {
         .collect()
 }
 
-/// Parses `adb devices` output into serial and state pairs.
+/// Parses `adb devices [-l]` output: serial, state, then optional `key:value` pairs.
 pub fn parse_devices(text: &str) -> Vec<Device> {
     text.lines()
         .filter(|l| !l.starts_with("List of") && !l.starts_with('*'))
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
-            Some(Device {
-                serial: parts.next()?.to_string(),
-                state: parts.next()?.to_string(),
-            })
+            let serial = parts.next()?.to_string();
+            let state = parts.next()?.to_string();
+            let model = parts.find_map(|p| p.strip_prefix("model:")).map(|m| m.replace('_', " "));
+            Some(Device { serial, state, model })
         })
         .collect()
 }
@@ -232,7 +311,31 @@ mod tests {
         let d = parse_devices(text);
         assert_eq!(d.len(), 2);
         assert_eq!(d[0].state, "device");
+        assert_eq!(d[0].model, None);
         assert_eq!(d[1].serial, "192.168.1.20:37891");
+    }
+
+    #[test]
+    fn parses_long_devices() {
+        let text = "List of devices attached\n\
+                    adb-R9RYC00849A-ZxcWiN._adb-tls-connect._tcp device product:a07xx model:SM_A075F device:a07 transport_id:672\n\
+                    emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 transport_id:3\n";
+        let d = parse_devices(text);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].model.as_deref(), Some("SM A075F"));
+        assert!(d[0].is_wireless());
+        assert!(!d[1].is_wireless());
+    }
+
+    #[test]
+    fn wireless_serials() {
+        let dev = |s: &str| Device { serial: s.into(), state: "device".into(), model: None };
+        assert!(dev("192.168.1.20:37891").is_wireless());
+        assert!(dev("[fe80::1]:5555").is_wireless());
+        assert!(dev("adb-X-y._adb-tls-connect._tcp").is_wireless());
+        assert!(!dev("emulator-5554").is_wireless());
+        assert!(!dev("R5CT1234ABC").is_wireless());
+        assert!(!is_mdns_serial("192.168.1.20:37891"));
     }
 
     #[test]
