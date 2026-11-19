@@ -2,7 +2,7 @@
 
 Android Studio is somehow.... Sometimes works, sometimes doesn't work at all. So, this will fix that "sometimes". At least on my machine.
 
-`adbqr` is a small desktop app that shows a pairing QR code. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed. It also lists the devices connected over Wi-Fi and lets you disconnect them.
+`adbqr` is a small desktop app that shows a pairing QR code. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed. It also lists the devices connected over Wi-Fi and lets you disconnect and reconnect them.
 
 ![adbqr showing a pairing QR code and the list of Wi-Fi devices](docs/app.png)
 
@@ -22,6 +22,12 @@ The **Wi-Fi devices** panel lists every device adb is connected to over Wi-Fi an
 
 - Devices listed by address (`192.168.1.20:37891`) are disconnected with `adb disconnect`.
 - Devices listed by mDNS name (`adb-XXXX._adb-tls-connect._tcp`) can't be disconnected that way: `adb disconnect` only takes an address, and adb reconnects paired phones it finds on the network by itself. For these, adbqr turns off **Wireless debugging** on the phone, which drops the connection and keeps it dropped. Turn it back on in Developer options to reconnect; the pairing is kept.
+
+### Reconnecting without a QR code
+
+Pairing is kept, so a phone only needs the QR code once per PC. Under **Not connected**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb. **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
+
+A phone with Wireless debugging off can't be reached from the PC. That includes phones disconnected by turning it off, and phones that changed Wi-Fi network or rebooted, since Android turns it off then. Turn it back on in Developer options, and the phone shows up under **Not connected** (or adb reconnects it on its own).
 
 ### Other controls
 

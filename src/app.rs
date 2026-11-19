@@ -1,6 +1,6 @@
 //! The desktop window: pairing on the left, Wi-Fi devices on the right, adb log below.
 
-use crate::adb::{self, Adb, Device, Logger};
+use crate::adb::{self, Adb, Device, Logger, MdnsService};
 use crate::pairing::{Session, MAX_ATTEMPTS};
 use crate::qr;
 use eframe::egui::{self, Color32, RichText, Sense, Vec2};
@@ -18,6 +18,8 @@ const OK_GREEN: Color32 = Color32::from_rgb(0x2e, 0xa0, 0x43);
 #[derive(Default)]
 struct DeviceList {
     devices: Vec<Device>,
+    /// Phones with Wireless debugging on that adb isn't connected to.
+    available: Vec<MdnsService>,
     error: Option<String>,
     loaded: bool,
 }
@@ -30,8 +32,9 @@ struct Shared {
     adb: Mutex<Option<Adb>>,
     devices: Mutex<DeviceList>,
     refresh_now: AtomicBool,
-    disconnecting: Mutex<HashSet<String>>,
-    /// Result of the last disconnect: message and whether it failed.
+    /// Serials being disconnected and addresses being reconnected.
+    busy: Mutex<HashSet<String>>,
+    /// Result of the last disconnect or reconnect: message and whether it failed.
     notice: Mutex<Option<(String, bool)>>,
 }
 
@@ -70,7 +73,7 @@ impl App {
             adb: Mutex::default(),
             devices: Mutex::default(),
             refresh_now: AtomicBool::new(false),
-            disconnecting: Mutex::default(),
+            busy: Mutex::default(),
             notice: Mutex::default(),
         });
         spawn_device_poller(shared.clone());
@@ -122,24 +125,40 @@ impl App {
     }
 
     fn disconnect(&self, serials: Vec<String>) {
+        self.run_each(serials, |adb, serial| {
+            adb.disconnect(serial).map_err(|e| format!("Could not disconnect {serial}: {e}"))
+        });
+    }
+
+    fn reconnect(&self, addrs: Vec<String>) {
+        self.run_each(addrs, |adb, addr| {
+            adb.connect(addr).map_err(|e| format!("Could not reconnect {addr}: {e}"))
+        });
+    }
+
+    /// Runs `action` on each target in the background, marking it busy until
+    /// done, then shows the combined result as a notice.
+    fn run_each(
+        &self,
+        targets: Vec<String>,
+        action: impl Fn(&Adb, &str) -> Result<String, String> + Send + 'static,
+    ) {
         let Ok(adb) = self.adb.clone() else { return };
         let shared = self.shared.clone();
-        {
-            let mut busy = shared.disconnecting.lock().unwrap();
-            busy.extend(serials.iter().cloned());
-        }
+        *shared.notice.lock().unwrap() = None;
+        shared.busy.lock().unwrap().extend(targets.iter().cloned());
         thread::spawn(move || {
             let mut messages = Vec::new();
             let mut failed = false;
-            for serial in serials {
-                match adb.disconnect(&serial) {
+            for target in targets {
+                match action(&adb, &target) {
                     Ok(m) => messages.push(m),
                     Err(e) => {
                         failed = true;
-                        messages.push(format!("Could not disconnect {serial}: {e}"));
+                        messages.push(e);
                     }
                 }
-                shared.disconnecting.lock().unwrap().remove(&serial);
+                shared.busy.lock().unwrap().remove(&target);
                 shared.refresh();
                 shared.ctx.request_repaint();
             }
@@ -275,13 +294,13 @@ impl App {
         });
         ui.add_space(4.0);
 
-        let (wireless, other, error, loaded) = {
+        let (wireless, other, available, error, loaded) = {
             let list = self.shared.devices.lock().unwrap();
             let (w, o): (Vec<Device>, Vec<Device>) =
                 list.devices.iter().cloned().partition(Device::is_wireless);
-            (w, o.len(), list.error.clone(), list.loaded)
+            (w, o.len(), list.available.clone(), list.error.clone(), list.loaded)
         };
-        let busy = self.shared.disconnecting.lock().unwrap().clone();
+        let busy = self.shared.busy.lock().unwrap().clone();
 
         if let Some(e) = error {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -295,6 +314,7 @@ impl App {
         }
 
         let mut to_disconnect = Vec::new();
+        let mut to_reconnect = Vec::new();
         egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 80.0).show(ui, |ui| {
             for d in &wireless {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -320,6 +340,36 @@ impl App {
                         });
                     });
                 });
+            }
+
+            if !available.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Not connected").strong())
+                    .on_hover_text("Phones on this network with Wireless debugging on that adb isn't connected to.");
+                for s in &available {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&s.instance).strong());
+                                ui.label(RichText::new(&s.addr).small().weak());
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if busy.contains(&s.addr) {
+                                    ui.spinner();
+                                } else if ui
+                                    .button("Reconnect")
+                                    .on_hover_text(
+                                        "Runs adb connect for this address. Works without a QR code                                          if the phone was paired with this PC before.",
+                                    )
+                                    .clicked()
+                                {
+                                    to_reconnect.push(s.addr.clone());
+                                }
+                            });
+                        });
+                    });
+                }
             }
         });
 
@@ -349,8 +399,10 @@ impl App {
         }
 
         if !to_disconnect.is_empty() {
-            *self.shared.notice.lock().unwrap() = None;
             self.disconnect(to_disconnect);
+        }
+        if !to_reconnect.is_empty() {
+            self.reconnect(to_reconnect);
         }
     }
 
@@ -446,9 +498,11 @@ fn spawn_device_poller(shared: Arc<Shared>) {
         let adb = shared.adb.lock().unwrap().clone();
         if let Some(adb) = adb {
             let result = adb.devices();
+            let services = adb.mdns_services().unwrap_or_default();
             let mut list = shared.devices.lock().unwrap();
             match result {
                 Ok(devices) => {
+                    list.available = adb::reconnectable(&services, &devices);
                     list.devices = devices;
                     list.error = None;
                 }

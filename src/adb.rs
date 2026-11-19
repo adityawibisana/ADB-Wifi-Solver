@@ -21,7 +21,7 @@ pub struct Output {
     pub text: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MdnsService {
     pub instance: String,
     pub service_type: String,
@@ -189,6 +189,22 @@ impl Adb {
         Ok(parse_devices(&self.run(&["devices", "-l"], Duration::from_secs(10))?.text))
     }
 
+    /// Connects to a phone's `ip:port` connection service. Works without a QR
+    /// code only if the phone was paired with this PC before.
+    pub fn connect(&self, addr: &str) -> Result<String, String> {
+        let out = self.run(&["connect", addr], Duration::from_secs(15))?;
+        let text = out.text.trim();
+        if text.contains("connected to") && !text.contains("failed") {
+            Ok(format!("Reconnected {addr}"))
+        } else if text.contains("authenticat") || text.contains("protocol fault") {
+            Err(format!(
+                "{addr} refused the connection. It is probably not paired with this PC;                  pair it with the QR code. ({text})"
+            ))
+        } else {
+            Err(text.to_string())
+        }
+    }
+
     /// Ends a Wi-Fi connection and returns a message describing what was done.
     ///
     /// `adb disconnect` only accepts `ip:port`, and the adb server reconnects
@@ -250,6 +266,21 @@ pub fn parse_mdns_services(text: &str) -> Vec<MdnsService> {
             })
         })
         .collect()
+}
+
+/// Phones advertising Wireless debugging that adb isn't connected to, one per
+/// phone. adb only lets them connect if they were paired with this PC before.
+pub fn reconnectable(services: &[MdnsService], devices: &[Device]) -> Vec<MdnsService> {
+    let mut out: Vec<MdnsService> = Vec::new();
+    for s in services.iter().filter(|s| s.service_type.contains("_adb-tls-connect")) {
+        let connected = devices.iter().any(|d| {
+            d.serial == s.addr || d.serial.strip_prefix(s.instance.as_str()).is_some_and(|r| r.starts_with('.'))
+        });
+        if !connected && !out.iter().any(|o| o.instance == s.instance) {
+            out.push(s.clone());
+        }
+    }
+    out
 }
 
 /// Parses `adb devices [-l]` output: serial, state, then optional `key:value` pairs.
@@ -345,6 +376,33 @@ mod tests {
         assert_eq!(pair_guid(ok).as_deref(), Some("adb-R5CT1234-AbCdEf"));
         assert!(!pair_succeeded("Failed: Unable to start pairing client.\n"));
         assert_eq!(pair_guid("no guid here"), None);
+    }
+
+    #[test]
+    fn reconnectable_services() {
+        let svc = |i: &str, t: &str, a: &str| MdnsService {
+            instance: i.into(),
+            service_type: t.into(),
+            addr: a.into(),
+        };
+        let dev = |s: &str| Device { serial: s.into(), state: "device".into(), model: None };
+        let services = [
+            svc("adb-A-1", "_adb-tls-connect._tcp", "192.168.1.20:37891"),
+            svc("adb-A-1", "_adb-tls-connect._tcp", "[fe80::1]:37891"),
+            svc("adb-B-2", "_adb-tls-connect._tcp", "192.168.1.21:40000"),
+            svc("adb-C-3", "_adb-tls-connect._tcp", "192.168.1.22:40001"),
+            svc("adb-D-4", "_adb-tls-connect._tcp", "192.168.1.23:40002"),
+            svc("adbqr-x", "_adb-tls-pairing._tcp", "192.168.1.20:41234"),
+        ];
+        let devices = [
+            dev("adb-B-2._adb-tls-connect._tcp"),
+            dev("192.168.1.22:40001"),
+            dev("adb-D-40._adb-tls-connect._tcp"),
+        ];
+        let r = reconnectable(&services, &devices);
+        let names: Vec<&str> = r.iter().map(|s| s.instance.as_str()).collect();
+        assert_eq!(names, ["adb-A-1", "adb-D-4"]);
+        assert_eq!(r[0].addr, "192.168.1.20:37891");
     }
 
     #[test]
