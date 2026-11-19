@@ -65,6 +65,7 @@ The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). On Windows t
 - **Nothing happens after scanning.** Pairing is found over mDNS (UDP 5353). Make sure your firewall allows adb on this network. On Windows, the network should be set to *Private*.
 - **"mDNS is unavailable" warning.** Update platform-tools.
 - **A disconnected phone comes back.** For phones listed by mDNS name, Disconnect turns off Wireless debugging; if it's turned back on, adb reconnects. Check the adb log for what happened.
+- **"The adb server isn't responding."** The adb server stopped answering, so every adb command hangs, including those from Android Studio. Click **Restart adb server**: it runs `adb kill-server`, force-kills the server process if that doesn't work, and starts a new one. Other adb tools reconnect on their own.
 - **Something else.** Open **Show adb log** to see every adb command and what it printed.
 
 ## How it works

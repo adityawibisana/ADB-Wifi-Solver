@@ -14,6 +14,8 @@ const POLL: Duration = Duration::from_millis(500);
 pub const MAX_ATTEMPTS: u32 = 3;
 const FIREWALL_HINT_AFTER: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+pub const SERVER_HUNG: &str = "The adb server isn't responding. Restart it with \"Restart adb server\" at the top, \
+                               then try again.";
 
 /// What the UI shows while a pairing session runs.
 #[derive(Default)]
@@ -105,7 +107,15 @@ impl Worker {
 
     fn run(&self) -> Result<String, String> {
         self.status("Starting adb...");
-        let started = self.adb.run(&["start-server"], Duration::from_secs(30))?;
+        // Starting a server takes a few seconds; a running one answers at
+        // once. Waiting longer only delays telling the user it is hung.
+        let started = self.adb.run(&["start-server"], Duration::from_secs(15)).map_err(|e| {
+            if adb::is_timeout(&e) {
+                SERVER_HUNG.to_string()
+            } else {
+                e
+            }
+        })?;
         if !started.success {
             return Err(format!("adb start-server failed: {}", started.text.trim()));
         }

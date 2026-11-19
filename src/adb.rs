@@ -120,13 +120,7 @@ impl Adb {
             log(format!("> adb {}", args.join(" ")));
         }
         let mut command = Command::new(&self.path);
-        #[cfg(windows)]
-        {
-            // Don't flash a console window for every adb call.
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
+        hide_console(&mut command);
         let mut child = command
             .args(args)
             .stdin(Stdio::null())
@@ -181,12 +175,49 @@ impl Adb {
         Ok(Output { success: status.success(), text })
     }
 
+    fn note(&self, line: String) {
+        if let Some(log) = &self.log {
+            log(line);
+        }
+    }
+
+    // Both answer instantly from a healthy server, so a short timeout spots a
+    // hung one quickly.
     pub fn mdns_services(&self) -> Result<Vec<MdnsService>, String> {
-        Ok(parse_mdns_services(&self.run(&["mdns", "services"], Duration::from_secs(10))?.text))
+        Ok(parse_mdns_services(&self.run(&["mdns", "services"], Duration::from_secs(5))?.text))
     }
 
     pub fn devices(&self) -> Result<Vec<Device>, String> {
-        Ok(parse_devices(&self.run(&["devices", "-l"], Duration::from_secs(10))?.text))
+        Ok(parse_devices(&self.run(&["devices", "-l"], Duration::from_secs(5))?.text))
+    }
+
+    /// Restarts a hung adb server. Tries `adb kill-server` first; a hung
+    /// server usually ignores that too, so then it kills the adb process
+    /// listening on the server port. Other programs using adb (Android
+    /// Studio, scrcpy) lose their connections and reconnect on their own.
+    ///
+    /// Success is judged by whether a server answers, not by whether the port
+    /// is free: any adb call (this app's own polling included) starts a fresh
+    /// server as soon as the old one is gone, and that one must not be killed.
+    pub fn restart_server(&self) -> Result<String, String> {
+        let _ = self.run(&["kill-server"], Duration::from_secs(5));
+        // Long enough for this call to cold-start a server if kill-server worked.
+        if self.run(&["devices"], Duration::from_secs(10)).is_err() {
+            let port = server_port();
+            let pid = listener_pid(port).ok_or_else(|| {
+                format!("adb kill-server did not stop the server, and no process listening on port {port} was found")
+            })?;
+            self.note(format!("> kill adb server process {pid}"));
+            kill_adb_process(pid)?;
+            thread::sleep(Duration::from_millis(500));
+        }
+        let out = self.run(&["start-server"], Duration::from_secs(20))?;
+        if !out.success {
+            return Err(format!("adb start-server failed: {}", out.text.trim()));
+        }
+        self.run(&["devices"], Duration::from_secs(5))
+            .map_err(|e| format!("Restarted adb, but it still isn't responding: {e}"))?;
+        Ok("Restarted the adb server".into())
     }
 
     /// Connects to a phone's `ip:port` connection service. Works without a QR
@@ -221,14 +252,22 @@ impl Adb {
             };
         }
 
+        // Turning Wireless debugging off drops the very connection the shell
+        // command runs over, and a command still running at that moment can
+        // hang the adb server. So the phone runs it in the background a
+        // second later, and the shell returns right away.
         let result = self.run(
-            &["-s", serial, "shell", "settings", "put", "global", "adb_wifi_enabled", "0"],
+            &[
+                "-s",
+                serial,
+                "shell",
+                "nohup sh -c 'sleep 1; settings put global adb_wifi_enabled 0' >/dev/null 2>&1 &",
+            ],
             Duration::from_secs(10),
         );
-        // The phone can drop the connection before the command reports back,
-        // so judge by whether the device actually goes away.
+        // Judge by whether the device actually goes away.
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
+        while start.elapsed() < Duration::from_secs(6) {
             match self.quiet().devices() {
                 Ok(devices) if !devices.iter().any(|d| d.serial == serial) => {
                     return Ok(format!("Turned off Wireless debugging on {serial}"));
@@ -243,6 +282,91 @@ impl Adb {
             Ok(out) => Err(out.text.trim().to_string()),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Whether an error from [`Adb::run`] is a timeout. A timeout on a command
+/// that should answer instantly means the adb server is hung.
+pub fn is_timeout(err: &str) -> bool {
+    err.ends_with(" timed out")
+}
+
+/// Don't flash a console window for every command on Windows.
+fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+/// Runs a helper program (netstat, taskkill, ...) and returns its stdout.
+fn capture(program: &str, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new(program);
+    hide_console(&mut command);
+    let out = command
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!("{program} failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn server_port() -> u16 {
+    env::var("ADB_SERVER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5037)
+}
+
+/// The process listening on a local TCP port.
+fn listener_pid(port: u16) -> Option<u32> {
+    if cfg!(windows) {
+        parse_netstat_listener(&capture("netstat", &["-ano", "-p", "TCP"]).ok()?, port)
+    } else {
+        let out = capture("lsof", &["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]).ok()?;
+        out.lines().next()?.trim().parse().ok()
+    }
+}
+
+/// Finds the listener on `port` in `netstat -ano` output. Listening sockets
+/// have a foreign port of 0; matching on that avoids the state column, whose
+/// text ("LISTENING") is translated on non-English Windows.
+fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
+    let suffix = format!(":{port}");
+    text.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 5
+            && parts[0].eq_ignore_ascii_case("TCP")
+            && parts[1].ends_with(&suffix)
+            && parts[2].ends_with(":0")
+        {
+            parts[4].parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// Force-kills `pid`, but only if it is adb, so another program on the port is left alone.
+fn kill_adb_process(pid: u32) -> Result<(), String> {
+    let pid_s = pid.to_string();
+    if cfg!(windows) {
+        let name = capture("tasklist", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])?;
+        if !name.trim_start().to_ascii_lowercase().starts_with("\"adb") {
+            return Err(format!("PID {pid} on the adb port is not adb: {}", name.trim()));
+        }
+        capture("taskkill", &["/F", "/PID", &pid_s]).map(|_| ())
+    } else {
+        let name = capture("ps", &["-p", &pid_s, "-o", "comm="])?;
+        if !name.trim().rsplit('/').next().unwrap_or("").starts_with("adb") {
+            return Err(format!("PID {pid} on the adb port is not adb: {}", name.trim()));
+        }
+        capture("kill", &["-9", &pid_s]).map(|_| ())
     }
 }
 
@@ -403,6 +527,19 @@ mod tests {
         let names: Vec<&str> = r.iter().map(|s| s.instance.as_str()).collect();
         assert_eq!(names, ["adb-A-1", "adb-D-4"]);
         assert_eq!(r[0].addr, "192.168.1.20:37891");
+    }
+
+    #[test]
+    fn netstat_listener() {
+        let text = "\nActive Connections\n\n  Proto  Local Address          Foreign Address        State           PID\n  TCP    127.0.0.1:5037         127.0.0.1:49262        ESTABLISHED     10516\n  TCP    0.0.0.0:15037          0.0.0.0:0              LISTENING       4\n  TCP    127.0.0.1:5037         0.0.0.0:0              ABHOEREN        10516\n";
+        assert_eq!(parse_netstat_listener(text, 5037), Some(10516));
+        assert_eq!(parse_netstat_listener(text, 5038), None);
+    }
+
+    #[test]
+    fn timeouts() {
+        assert!(is_timeout("adb devices -l timed out"));
+        assert!(!is_timeout("adb devices -l failed: oops"));
     }
 
     #[test]

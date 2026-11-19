@@ -21,6 +21,8 @@ struct DeviceList {
     /// Phones with Wireless debugging on that adb isn't connected to.
     available: Vec<MdnsService>,
     error: Option<String>,
+    /// `adb devices` timed out: the server is running but not answering.
+    server_hung: bool,
     loaded: bool,
 }
 
@@ -36,6 +38,11 @@ struct Shared {
     busy: Mutex<HashSet<String>>,
     /// Result of the last disconnect or reconnect: message and whether it failed.
     notice: Mutex<Option<(String, bool)>>,
+    restarting: AtomicBool,
+    /// Set when a server restart succeeds, so the UI can start pairing over.
+    restarted: AtomicBool,
+    /// Result of the last server restart: message and whether it failed.
+    restart_notice: Mutex<Option<(String, bool)>>,
 }
 
 impl Shared {
@@ -75,6 +82,9 @@ impl App {
             refresh_now: AtomicBool::new(false),
             busy: Mutex::default(),
             notice: Mutex::default(),
+            restarting: AtomicBool::new(false),
+            restarted: AtomicBool::new(false),
+            restart_notice: Mutex::default(),
         });
         spawn_device_poller(shared.clone());
 
@@ -134,6 +144,68 @@ impl App {
         self.run_each(addrs, |adb, addr| {
             adb.connect(addr).map_err(|e| format!("Could not reconnect {addr}: {e}"))
         });
+    }
+
+    fn restart_server(&self) {
+        let Ok(adb) = self.adb.clone() else { return };
+        let shared = self.shared.clone();
+        if shared.restarting.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        *shared.restart_notice.lock().unwrap() = None;
+        thread::spawn(move || {
+            let result = adb.restart_server();
+            if result.is_ok() {
+                shared.restarted.store(true, Ordering::Relaxed);
+            }
+            *shared.restart_notice.lock().unwrap() = Some(match result {
+                Ok(m) => (m, false),
+                Err(e) => (e, true),
+            });
+            shared.restarting.store(false, Ordering::Relaxed);
+            shared.refresh();
+            shared.ctx.request_repaint();
+        });
+    }
+
+    /// Shown under the adb path while the server is hung or being restarted.
+    fn server_banner(&mut self, ui: &mut egui::Ui) {
+        let hung = self.shared.devices.lock().unwrap().server_hung;
+        let restarting = self.shared.restarting.load(Ordering::Relaxed);
+        if hung || restarting {
+            ui.horizontal_wrapped(|ui| {
+                if restarting {
+                    ui.spinner();
+                    ui.label("Restarting the adb server...");
+                } else {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "The adb server isn't responding, so nothing that uses adb works.",
+                    );
+                    if ui
+                        .button("Restart adb server")
+                        .on_hover_text(
+                            "Stops the adb server, forcibly if needed, and starts a new one. \
+                             Android Studio and other adb tools lose their device connections \
+                             for a moment and reconnect on their own.",
+                        )
+                        .clicked()
+                    {
+                        self.restart_server();
+                    }
+                }
+            });
+        }
+        let notice = self.shared.restart_notice.lock().unwrap().clone();
+        if let Some((msg, failed)) = notice {
+            ui.horizontal_wrapped(|ui| {
+                let color = if failed { ui.visuals().error_fg_color } else { OK_GREEN };
+                ui.colored_label(color, msg);
+                if ui.small_button("✕").clicked() {
+                    *self.shared.restart_notice.lock().unwrap() = None;
+                }
+            });
+        }
     }
 
     /// Runs `action` on each target in the background, marking it busy until
@@ -429,9 +501,21 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // After a restart the old pairing session was talking to the dead
+        // server; start over unless it already connected a phone.
+        if self.shared.restarted.swap(false, Ordering::Relaxed) {
+            let connected = self
+                .session
+                .as_ref()
+                .is_some_and(|s| matches!(s.progress.lock().unwrap().outcome, Some(Ok(_))));
+            if self.session.is_some() && !connected {
+                self.start_pairing();
+            }
+        }
         egui::Panel::top("adb").show(ui, |ui| {
             ui.add_space(4.0);
             self.adb_bar(ui);
+            self.server_banner(ui);
             ui.add_space(2.0);
         });
         egui::Panel::bottom("log")
@@ -498,15 +582,20 @@ fn spawn_device_poller(shared: Arc<Shared>) {
         let adb = shared.adb.lock().unwrap().clone();
         if let Some(adb) = adb {
             let result = adb.devices();
-            let services = adb.mdns_services().unwrap_or_default();
+            // No point asking a server that just failed to answer.
+            let services = if result.is_ok() { adb.mdns_services().unwrap_or_default() } else { Vec::new() };
             let mut list = shared.devices.lock().unwrap();
             match result {
                 Ok(devices) => {
                     list.available = adb::reconnectable(&services, &devices);
                     list.devices = devices;
                     list.error = None;
+                    list.server_hung = false;
                 }
-                Err(e) => list.error = Some(e),
+                Err(e) => {
+                    list.server_hung = adb::is_timeout(&e);
+                    list.error = Some(if list.server_hung { "The adb server isn't responding.".into() } else { e });
+                }
             }
             list.loaded = true;
             drop(list);
