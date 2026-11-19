@@ -4,6 +4,8 @@ Android Studio is somehow.... Sometimes works, sometimes doesn't work at all. So
 
 `adbqr` shows a pairing QR code right in your terminal. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed.
 
+![adbqr showing a pairing QR code in the terminal](docs/qr.png)
+
 ## Usage
 
 On the phone: **Developer options > Wireless debugging > Pair device with QR code**, then run:
@@ -25,6 +27,11 @@ If a scan fails, it makes a new QR code and tries again (3 attempts in total).
 
 ### Options
 
+![adbqr --help output](docs/help.png)
+
+<details>
+<summary>Options as text</summary>
+
 ```
 --timeout <sec>  Seconds to wait for the phone to scan each QR code (default 120)
 --adb <path>     Path to adb or its folder (default: PATH, then the Android SDK)
@@ -34,6 +41,8 @@ If a scan fails, it makes a new QR code and tries again (3 attempts in total).
 --verbose        Print every adb command and its output
 -h, --help       Show help
 ```
+
+</details>
 
 Exit codes: `0` connected, `1` adb not found, `2` timeout, `3` pairing failed, `4` connect failed, `5` bad arguments, `6` other error.
 
