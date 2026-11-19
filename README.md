@@ -54,7 +54,9 @@ Exit codes: `0` connected, `1` adb not found, `2` timeout, `3` pairing failed, `
 
 ## Install
 
-With [Rust](https://rustup.rs) installed:
+**Windows:** download [`adbqr.exe`](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest/download/adbqr.exe) from the [latest release](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest). It's a single file with nothing to install. Run it from a terminal, or double-click it and add `--keep-open` through a shortcut so the window stays open.
+
+**Any platform**, with [Rust](https://rustup.rs) installed:
 
 ```
 cargo install --git https://github.com/adityawibisana/ADB-Wifi-Solver
