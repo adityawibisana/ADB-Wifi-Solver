@@ -1,0 +1,22 @@
+[package]
+name = "adbqr"
+version = "0.1.0"
+edition = "2021"
+description = "Show a QR code; scan it on an Android phone to pair and connect ADB over Wi-Fi."
+license = "MIT"
+repository = "https://github.com/adityawibisana/ADB-Wifi-Solver"
+readme = "README.md"
+keywords = ["adb", "android", "wireless-debugging", "qrcode", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+qrcode = { version = "0.14", default-features = false }
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
