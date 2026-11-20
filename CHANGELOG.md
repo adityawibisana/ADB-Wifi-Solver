@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.0 - 2026-11-20
+
+- Move the UI from egui to Tauri (050d43f)
+
 ## v0.2.0 - 2026-11-19
 
 - Add nightly release workflow (11a1cbf)
