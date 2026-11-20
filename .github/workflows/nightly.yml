@@ -40,7 +40,7 @@ jobs:
           if [ -z "$PREV" ]; then
             echo "No previous release tag; releasing."
             echo "changed=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "$PREV" HEAD -- src Cargo.toml Cargo.lock build.rs assets .cargo; then
+          elif git diff --quiet "$PREV" HEAD -- src ui capabilities tauri.conf.json Cargo.toml Cargo.lock build.rs assets .cargo; then
             echo "No code changes since $PREV; nothing to release."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
@@ -126,7 +126,7 @@ jobs:
             echo
             echo "## Download"
             echo
-            echo "Download **adbqr.exe** below (Windows x64). It's a single file and doesn't need the VC++ redistributable."
+            echo "Download **adbqr.exe** below (Windows x64). It's a single file and doesn't need the VC++ redistributable. It uses Microsoft Edge WebView2, which comes with Windows 10 and 11."
             echo
             echo "You need Android SDK Platform-Tools 34 or newer (adb), and the phone must be on the same Wi-Fi network. See the [README](https://github.com/${GITHUB_REPOSITORY}#readme) for usage and troubleshooting."
             echo

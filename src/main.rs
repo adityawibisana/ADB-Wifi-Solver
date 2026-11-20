@@ -8,6 +8,7 @@ mod qr;
 
 use std::sync::OnceLock;
 use std::time::Instant;
+use tauri::Manager;
 
 static LAUNCHED: OnceLock<Instant> = OnceLock::new();
 
@@ -16,15 +17,28 @@ pub fn ms_since_launch() -> u128 {
     LAUNCHED.get().map_or(0, |t| t.elapsed().as_millis())
 }
 
-fn main() -> eframe::Result {
+fn main() {
     LAUNCHED.get_or_init(Instant::now);
-    let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("adbqr")
-        .with_inner_size([820.0, 620.0])
-        .with_min_inner_size([620.0, 480.0]);
-    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
-        viewport = viewport.with_icon(icon);
-    }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("adbqr", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    tauri::Builder::default()
+        .setup(|app| {
+            let shared = app::Shared::new(app.handle().clone());
+            app.manage(shared.clone());
+            shared.start();
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            app::get_state,
+            app::get_log,
+            app::clear_log,
+            app::set_adb,
+            app::start_pairing,
+            app::cancel_pairing,
+            app::disconnect,
+            app::reconnect,
+            app::restart_server,
+            app::refresh,
+            app::dismiss_notice,
+        ])
+        .run(tauri::generate_context!())
+        .expect("could not start adbqr");
 }

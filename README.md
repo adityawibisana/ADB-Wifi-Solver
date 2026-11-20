@@ -10,9 +10,9 @@ Android Studio is somehow.... Sometimes works, sometimes doesn't work at all. So
 
 1. On the phone: **Developer options > Wireless debugging > Pair device with QR code**.
 2. Open adbqr. A QR code is shown right away.
-3. Scan it. adbqr pairs, connects, and shows `Connected: Pixel 8 (192.168.1.20:37891)`.
+3. Scan it. adbqr pairs, connects, and shows **Connected** with the phone's name and address, for example `Pixel 8 (192.168.1.20:37891)`.
 
-Each QR code is valid for the scan timeout (120 seconds by default; change it before showing a new code). If pairing fails, a new QR code is generated and tried again, 3 attempts in total. When a code expires, click **Show new QR code**:
+Each QR code is valid for the scan timeout (120 seconds by default), and a bar under the steps counts down. If pairing fails, a new QR code is generated and tried again, 3 attempts in total. When a code expires, click **Show new QR code**; the **Scan timeout** next to it sets how long the next code stays valid:
 
 ![The QR code expired, with a Show new QR code button](docs/expired.png)
 
@@ -25,14 +25,17 @@ The **Wi-Fi devices** panel lists every device adb is connected to over Wi-Fi an
 
 ### Reconnecting without a QR code
 
-Pairing is kept, so a phone only needs the QR code once per PC. Under **Not connected**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb. **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
+Pairing is kept, so a phone only needs the QR code once per PC. Under **Not connected**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb, by serial number (hover for the full mDNS name). **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
 
 A phone with Wireless debugging off can't be reached from the PC. That includes phones disconnected by turning it off, and phones that changed Wi-Fi network or rebooted, since Android turns it off then. Turn it back on in Developer options, and the phone shows up under **Not connected** (or adb reconnects it on its own).
 
 ### Other controls
 
 - **adb** (top bar): the adb that's in use. Click **Change** to point at a different `adb` or platform-tools folder.
-- **Show adb log** (bottom): every adb command adbqr ran and what it printed. Useful when something goes wrong.
+- **Show adb log** (bottom): every adb command adbqr ran and what it printed, with **Copy** and **Clear**. Useful when something goes wrong.
+- The refresh button next to **Wi-Fi devices** updates the list right away instead of waiting for the next 2-second refresh.
+
+The window follows the system's light or dark theme.
 
 ## Requirements
 
@@ -42,7 +45,7 @@ A phone with Wireless debugging off can't be reached from the PC. That includes 
 
 ## Install
 
-**Windows:** download [`adbqr.exe`](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest/download/adbqr.exe) from the [latest release](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest). It's a single file with nothing to install; double-click to run.
+**Windows:** download [`adbqr.exe`](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest/download/adbqr.exe) from the [latest release](https://github.com/adityawibisana/ADB-Wifi-Solver/releases/latest). It's a single file with nothing to install; double-click to run. It draws its window with Microsoft Edge WebView2, which comes with Windows 10 and 11.
 
 **Any platform**, with [Rust](https://rustup.rs) installed:
 
@@ -58,7 +61,11 @@ cd ADB-Wifi-Solver
 cargo build --release
 ```
 
-The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). On Windows the C runtime is linked statically, so the .exe runs on its own. On Linux, building needs the usual X11/Wayland development packages (for example `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libgl1-mesa-dev`).
+The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). No Node.js or Tauri CLI is needed: the UI is plain HTML, CSS and JavaScript in [`ui/`](ui), embedded into the executable at build time.
+
+- **Windows:** the C runtime is linked statically, so the .exe runs on its own.
+- **macOS:** nothing extra beyond Xcode's command line tools.
+- **Linux:** building needs WebKitGTK and its development packages. On Debian or Ubuntu: `sudo apt install libwebkit2gtk-4.1-dev build-essential libssl-dev librsvg2-dev`. For other distributions, see [Tauri's prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
 
 ## Troubleshooting
 
@@ -75,7 +82,7 @@ The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). On Windows t
 3. Runs `adb pair <addr> <password>`.
 4. Waits for the phone's `_adb-tls-connect` service and runs `adb connect` if adb doesn't connect on its own.
 
-The window is built with [egui](https://github.com/emilk/egui).
+The window is built with [Tauri](https://tauri.app). The Rust side ([`src/`](src)) runs adb and does the pairing; the page in [`ui/`](ui) fetches the app's state from it and redraws whenever it changes.
 
 ## License
 

@@ -238,7 +238,7 @@ impl Adb {
             Ok(format!("Reconnected {addr}"))
         } else if text.contains("authenticat") || text.contains("protocol fault") {
             Err(format!(
-                "{addr} refused the connection. It is probably not paired with this PC;                  pair it with the QR code. ({text})"
+                "{addr} refused the connection. It is probably not paired with this PC; pair it with the QR code. ({text})"
             ))
         } else {
             Err(text.to_string())

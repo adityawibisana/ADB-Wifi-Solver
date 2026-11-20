@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>adbqr</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 256 256" aria-hidden="true">
+        <rect x="8" y="8" width="240" height="240" rx="52" fill="#16222A"/>
+        <g fill="#fff">
+          <path fill-rule="evenodd" d="M40 40h66v66h-66z M51 51v44h44v-44z"/><rect x="62" y="62" width="22" height="22"/>
+          <path fill-rule="evenodd" d="M150 40h66v66h-66z M161 51v44h44v-44z"/><rect x="172" y="62" width="22" height="22"/>
+          <path fill-rule="evenodd" d="M40 150h66v66h-66z M51 161v44h44v-44z"/><rect x="62" y="172" width="22" height="22"/>
+          <rect x="117" y="40" width="22" height="22"/><rect x="117" y="84" width="22" height="22"/>
+          <rect x="40" y="117" width="22" height="22"/><rect x="84" y="117" width="22" height="22"/>
+        </g>
+        <g fill="none" stroke="#3DDC84" stroke-width="13" stroke-linecap="round">
+          <path d="M141.4 166.2 A58 58 0 0 1 224.6 166.2"/><path d="M156.6 183.4 A36 36 0 0 1 209.4 183.4"/>
+        </g>
+        <circle cx="183" cy="207" r="11" fill="#3DDC84"/>
+      </svg>
+      <span class="name">adbqr</span>
+    </div>
+    <div id="adb" class="adb"></div>
+  </header>
+
+  <div id="banner"></div>
+
+  <main class="grid">
+    <section class="card pair">
+      <div class="card-head">
+        <h2>Pair a phone</h2>
+        <span id="attempt" class="pill" hidden></span>
+      </div>
+      <div id="pair" class="pair-body"></div>
+    </section>
+
+    <section class="card devices">
+      <div class="card-head">
+        <h2>Wi-Fi devices <span id="count" class="count" hidden></span></h2>
+        <button class="icon-btn" data-action="refresh" title="Refresh now (the list also refreshes every 2 seconds)">
+          <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>
+        </button>
+      </div>
+      <div id="devices" class="devices-body"></div>
+    </section>
+  </main>
+
+  <footer class="log" id="log">
+    <div class="log-bar">
+      <button class="link-btn" data-action="toggle-log">
+        <svg viewBox="0 0 24 24"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
+        <span id="log-label">Show adb log</span>
+      </button>
+      <span class="spacer"></span>
+      <button class="link-btn" data-action="copy-log" data-log-only hidden>Copy</button>
+      <button class="link-btn" data-action="clear-log" data-log-only hidden>Clear</button>
+    </div>
+    <pre id="log-text" hidden></pre>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

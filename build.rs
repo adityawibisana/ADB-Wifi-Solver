@@ -1,10 +1,8 @@
 fn main() {
-    // Embed the app icon into adbqr.exe on Windows.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        println!("cargo:rerun-if-changed=assets/adbqr.rc");
-        println!("cargo:rerun-if-changed=assets/icon.ico");
-        embed_resource::compile("assets/adbqr.rc", embed_resource::NONE)
-            .manifest_optional()
-            .unwrap();
-    }
+    // The ui/ folder is embedded into the exe, so rebuild when it changes.
+    println!("cargo:rerun-if-changed=ui");
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+    println!("cargo:rerun-if-changed=capabilities");
+    // Embeds the app icon and Windows manifest, and checks tauri.conf.json.
+    tauri_build::build()
 }
