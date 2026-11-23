@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Builds an unoptimised exe with symbols and starts it under the
+      // debugger, so breakpoints in src/*.rs are hit right away.
+      "name": "Debug adbqr",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "preLaunchTask": "cargo build (debug)",
+      "program": "${workspaceFolder}/target/debug/adbqr.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "environment": [{ "name": "RUST_BACKTRACE", "value": "1" }],
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      // Builds the optimised, stripped exe (target/release/adbqr.exe)
+      // and runs it. No symbols, so breakpoints will not bind here.
+      "name": "Release adbqr (.exe)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "preLaunchTask": "cargo build (release)",
+      "program": "${workspaceFolder}/target/release/adbqr.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "stopAtEntry": false
+    }
+  ]
+}

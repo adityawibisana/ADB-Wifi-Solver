@@ -1,0 +1,11 @@
+{
+  // Lets you set breakpoints in .rs files when debugging with cppvsdbg.
+  "debug.allowBreakpointsEverywhere": true,
+
+  // This is a Windows (MSVC) project: open terminals and run tasks in cmd
+  // here, regardless of the user-level default (e.g. WSL).
+  "terminal.integrated.defaultProfile.windows": "Command Prompt",
+  "terminal.integrated.automationProfile.windows": {
+    "path": "C:\\Windows\\System32\\cmd.exe"
+  }
+}
