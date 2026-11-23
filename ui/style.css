@@ -445,6 +445,7 @@ button:disabled { cursor: default; opacity: 0.5; }
 .device-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .device-serial { color: var(--muted); font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
 .tag { margin-left: 6px; padding: 1px 6px; border-radius: 5px; background: var(--warn-soft); color: var(--warn); font-size: 11px; font-weight: 600; }
+.tag.ok { background: var(--accent-soft); color: var(--accent-text); white-space: nowrap; }
 
 .empty {
   display: flex;

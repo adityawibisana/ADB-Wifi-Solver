@@ -35,6 +35,7 @@ fn main() {
             app::cancel_pairing,
             app::disconnect,
             app::reconnect,
+            app::switch_to_wifi,
             app::restart_server,
             app::refresh,
             app::dismiss_notice,

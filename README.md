@@ -2,9 +2,9 @@
 
 Android Studio is somehow.... Sometimes works, sometimes doesn't work at all. So, this will fix that "sometimes". At least on my machine.
 
-`adbqr` is a small desktop app that shows a pairing QR code. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed. It also lists the devices connected over Wi-Fi and lets you disconnect and reconnect them.
+`adbqr` is a small desktop app that shows a pairing QR code. Scan it on your phone and it pairs and connects ADB over Wi-Fi, no Android Studio needed. It also lists the devices connected over Wi-Fi and lets you disconnect and reconnect them, and can switch a phone plugged in over USB to Wi-Fi.
 
-![adbqr showing a pairing QR code and the list of Wi-Fi devices](docs/app.png)
+![adbqr showing a pairing QR code and the list of devices](docs/app.png)
 
 ## Usage
 
@@ -18,22 +18,29 @@ Each QR code is valid for the scan timeout (120 seconds by default), and a bar u
 
 ### Disconnecting Wi-Fi devices
 
-The **Wi-Fi devices** panel lists every device adb is connected to over Wi-Fi and refreshes every 2 seconds. USB devices and emulators are not listed. **Disconnect** ends a device's connection, and **Disconnect all** does it for every listed device.
+The **Devices** panel lists every device adb is connected to over Wi-Fi under **Connected over Wi-Fi**, and refreshes every 2 seconds. Phones on a USB cable are listed under **Connected over USB** (see below); emulators are not listed. **Disconnect** ends a device's connection, and **Disconnect all** does it for every listed device.
 
 - Devices listed by address (`192.168.1.20:37891`) are disconnected with `adb disconnect`.
 - Devices listed by mDNS name (`adb-XXXX._adb-tls-connect._tcp`) can't be disconnected that way: `adb disconnect` only takes an address, and adb reconnects paired phones it finds on the network by itself. For these, adbqr turns off **Wireless debugging** on the phone, which drops the connection and keeps it dropped. Turn it back on in Developer options to reconnect; the pairing is kept.
 
 ### Reconnecting without a QR code
 
-Pairing is kept, so a phone only needs the QR code once per PC. Under **Not connected**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb, by serial number (hover for the full mDNS name). **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
+Pairing is kept, so a phone only needs the QR code once per PC. Under **Available on Wi-Fi**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb, by serial number (hover for the full mDNS name). **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
 
-A phone with Wireless debugging off can't be reached from the PC. That includes phones disconnected by turning it off, and phones that changed Wi-Fi network or rebooted, since Android turns it off then. Turn it back on in Developer options, and the phone shows up under **Not connected** (or adb reconnects it on its own).
+A phone with Wireless debugging off can't be reached from the PC. That includes phones disconnected by turning it off, and phones that changed Wi-Fi network or rebooted, since Android turns it off then. Turn it back on in Developer options, and the phone shows up under **Available on Wi-Fi** (or adb reconnects it on its own).
+
+### Switching a USB phone to Wi-Fi
+
+A phone plugged in with a USB cable, with USB debugging allowed, is listed under **Connected over USB**. **Switch to Wi-Fi** connects it over Wi-Fi without a QR code, because it already trusts this PC over USB. When it's done, the phone is listed under **Connected over Wi-Fi**, its USB row shows **On Wi-Fi**, and you can unplug the cable. The phone must be connected to the same Wi-Fi network as the PC.
+
+- **Android 11 and newer:** adbqr turns on **Wireless debugging** on the phone and connects to it. The first time on a Wi-Fi network, the phone may ask *Allow wireless debugging on this network?*; tap **Allow**. The phone then behaves like one paired with the QR code: Disconnect turns Wireless debugging off, and it shows up under **Available on Wi-Fi** when it's on but not connected.
+- **If that doesn't work** (older Android, the prompt isn't accepted within 30 seconds, or mDNS is blocked on the PC), adbqr falls back to `adb tcpip 5555` and connects to the phone's address on port 5555. That works on any Android version, but the connection doesn't survive a reboot, and until the phone restarts any PC on the network can try to connect on port 5555 (it still has to be allowed on the phone). The message after switching says which way was used.
 
 ### Other controls
 
 - **adb** (top bar): the adb that's in use. Click **Change** to point at a different `adb` or platform-tools folder.
 - **Show adb log** (bottom): every adb command adbqr ran and what it printed, with **Copy** and **Clear**. Useful when something goes wrong.
-- The refresh button next to **Wi-Fi devices** updates the list right away instead of waiting for the next 2-second refresh.
+- The refresh button next to **Devices** updates the list right away instead of waiting for the next 2-second refresh.
 
 The window follows the system's light or dark theme.
 

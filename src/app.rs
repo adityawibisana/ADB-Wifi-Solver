@@ -6,7 +6,7 @@ use crate::adb::{self, Adb, Device, Logger, MdnsService};
 use crate::pairing::{Session, MAX_ATTEMPTS};
 use crate::qr;
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -50,7 +50,11 @@ pub struct Shared {
     refresh_now: AtomicBool,
     /// Serials being disconnected and addresses being reconnected.
     busy: Mutex<HashSet<String>>,
-    /// Result of the last disconnect or reconnect.
+    /// What a USB phone being switched to Wi-Fi is doing, by serial.
+    progress: Mutex<HashMap<String, String>>,
+    /// USB serial -> Wi-Fi serial of phones switched to Wi-Fi, to mark them as on Wi-Fi.
+    switched: Mutex<HashMap<String, String>>,
+    /// Result of the last disconnect, reconnect or switch to Wi-Fi.
     notice: Mutex<Notice>,
     restarting: AtomicBool,
     /// Result of the last server restart.
@@ -71,6 +75,8 @@ impl Shared {
             devices: Mutex::default(),
             refresh_now: AtomicBool::new(false),
             busy: Mutex::default(),
+            progress: Mutex::default(),
+            switched: Mutex::default(),
             notice: Mutex::default(),
             restarting: AtomicBool::new(false),
             restart_notice: Mutex::default(),
@@ -237,8 +243,13 @@ impl Shared {
         });
 
         let busy = self.busy.lock().unwrap().clone();
+        let progress = self.progress.lock().unwrap().clone();
+        let switched = self.switched.lock().unwrap().clone();
         let list = self.devices.lock().unwrap();
         let (wireless, other): (Vec<&Device>, Vec<&Device>) = list.devices.iter().partition(|d| d.is_wireless());
+        let (usb, other): (Vec<&Device>, Vec<&Device>) = other.into_iter().partition(|d| d.is_usb());
+        let online_wireless: Vec<&str> =
+            wireless.iter().filter(|d| d.state == "device").map(|d| d.serial.as_str()).collect();
         let devices = DevicesDto {
             loaded: list.loaded,
             error: list.error.clone(),
@@ -256,6 +267,21 @@ impl Shared {
                 .available
                 .iter()
                 .map(|s| AvailableDto { name: s.instance.clone(), addr: s.addr.clone(), busy: busy.contains(&s.addr) })
+                .collect(),
+            usb: usb
+                .into_iter()
+                .map(|d| UsbDto {
+                    serial: d.serial.clone(),
+                    model: d.model.clone(),
+                    state: d.state.clone(),
+                    busy: busy.contains(&d.serial),
+                    progress: progress.get(&d.serial).cloned(),
+                    on_wifi: online_wireless.iter().any(|w| {
+                        switched.get(&d.serial).is_some_and(|s| s == w)
+                            || w.strip_suffix("._adb-tls-connect._tcp")
+                                .is_some_and(|i| adb::instance_is_phone(i, &d.serial))
+                    }),
+                })
                 .collect(),
             other_count: other.len(),
             notice: self.notice.lock().unwrap().as_ref().map(notice_dto),
@@ -322,6 +348,8 @@ struct DevicesDto {
     error: Option<String>,
     wireless: Vec<DeviceDto>,
     available: Vec<AvailableDto>,
+    usb: Vec<UsbDto>,
+    /// Emulators, which aren't listed.
     other_count: usize,
     notice: Option<NoticeDto>,
 }
@@ -334,6 +362,19 @@ struct DeviceDto {
     /// Listed by mDNS name, so Disconnect turns off Wireless debugging.
     mdns: bool,
     busy: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsbDto {
+    serial: String,
+    model: Option<String>,
+    state: String,
+    busy: bool,
+    /// What a switch to Wi-Fi in progress is doing.
+    progress: Option<String>,
+    /// Also connected over Wi-Fi.
+    on_wifi: bool,
 }
 
 #[derive(Serialize)]
@@ -422,6 +463,23 @@ pub fn reconnect(shared: S, addrs: Vec<String>) {
     shared.run_each(addrs, |adb, addr| adb.connect(addr).map_err(|e| format!("Could not reconnect {addr}: {e}")));
 }
 
+/// Moves USB-connected phones to Wi-Fi without a QR code.
+#[tauri::command]
+pub fn switch_to_wifi(shared: S, serials: Vec<String>) {
+    let s = shared.inner().clone();
+    shared.run_each(serials, move |adb, serial| {
+        let report = |text: &str| {
+            s.progress.lock().unwrap().insert(serial.to_string(), text.to_string());
+            s.changed();
+        };
+        let result = adb.switch_to_wifi(serial, &report);
+        s.progress.lock().unwrap().remove(serial);
+        let (addr, msg) = result.map_err(|e| format!("Could not switch {serial} to Wi-Fi: {e}"))?;
+        s.switched.lock().unwrap().insert(serial.to_string(), addr);
+        Ok(msg)
+    });
+}
+
 #[tauri::command]
 pub fn restart_server(shared: S) {
     shared.restart_server();
@@ -432,7 +490,7 @@ pub fn refresh(shared: S) {
     shared.refresh();
 }
 
-/// Hides a notice: `"devices"` for disconnect/reconnect results, `"server"` for restarts.
+/// Hides a notice: `"devices"` for disconnect/reconnect/switch results, `"server"` for restarts.
 #[tauri::command]
 pub fn dismiss_notice(shared: S, which: String) {
     match which.as_str() {

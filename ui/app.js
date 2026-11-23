@@ -166,7 +166,7 @@ function renderPairing() {
   } else if (p.outcome && p.outcome.ok) {
     box = `<div class="qr-box placeholder"><div class="qr-overlay"><div class="big-icon ok">${icons.check}</div></div></div>`;
     side = `<div><p class="headline ok">Connected</p><p class="sub">${esc(p.outcome.text)}</p></div>
-      <p class="sub">The phone stays paired with this PC. Next time, use <b>Reconnect</b> under Wi-Fi devices; no QR code needed.</p>
+      <p class="sub">The phone stays paired with this PC. Next time, use <b>Reconnect</b> under <b>Available on Wi-Fi</b>; no QR code needed.</p>
       <div class="actions"><button class="btn primary" data-action="pair">Pair another phone</button></div>`;
   } else if (p.outcome && p.expired) {
     box = `<div class="qr-box expired">${lastQr}<div class="qr-overlay"><div class="big-icon muted">${icons.clock}</div><b>QR code expired</b></div></div>`;
@@ -228,11 +228,14 @@ function renderDevices() {
   if (!usable) {
     d.wireless = [];
     d.available = [];
+    d.usb = [];
     d.otherCount = 0;
   }
   const count = $("count");
-  count.hidden = !d.wireless.length;
-  count.textContent = d.wireless.length;
+  // A phone switched from USB is on both lists; count it once.
+  const connected = d.wireless.length + d.usb.filter((u) => !u.onWifi).length;
+  count.hidden = !connected;
+  count.textContent = connected;
 
   let list = "";
   if (!state.adbPath) {
@@ -242,12 +245,12 @@ function renderDevices() {
   } else if (!d.loaded) {
     list = `<div class="empty"><span class="spinner"></span><span>Looking for devices...</span></div>`;
   } else if (!d.wireless.length && !d.available.length) {
-    list = `<div class="empty">${icons.wifiOff}<span>No devices connected over Wi-Fi.</span></div>`;
+    list = `<div class="empty">${icons.wifiOff}<span>No devices connected over Wi-Fi.${d.usb.length ? " A phone on USB can be switched to Wi-Fi below." : ""}</span></div>`;
   }
 
   if (usable) {
     if (d.wireless.length) {
-      list += `<div class="section-label">Connected</div>`;
+      list += `<div class="section-label">Connected over Wi-Fi</div>`;
       for (const dev of d.wireless) {
         const tip = dev.mdns
           ? "Turns off Wireless debugging on the phone. adb reconnects paired phones on its own, so this is what keeps it disconnected. Turn it back on in Developer options to reconnect."
@@ -264,7 +267,7 @@ function renderDevices() {
       }
     }
     if (d.available.length) {
-      list += `<div class="section-label" title="Phones on this network with Wireless debugging on that adb isn't connected to.">Not connected</div>`;
+      list += `<div class="section-label" title="Phones on this network with Wireless debugging on that adb isn't connected to.">Available on Wi-Fi</div>`;
       for (const s of d.available) {
         list += `<div class="device">
           <div class="device-icon">${icons.phone}<span class="dot off"></span></div>
@@ -273,6 +276,33 @@ function renderDevices() {
             <div class="device-serial">${esc(s.addr)}</div>
           </div>
           ${s.busy ? '<span class="spinner"></span>' : `<button class="btn small" data-action="reconnect" data-target="${esc(s.addr)}" title="Runs adb connect for this address. Works without a QR code if the phone was paired with this PC before.">Reconnect</button>`}
+        </div>`;
+      }
+    }
+    if (d.usb.length) {
+      list += `<div class="section-label" title="Phones connected with a USB cable. Switch to Wi-Fi connects them over Wi-Fi without a QR code, since they already trust this PC over USB.">Connected over USB</div>`;
+      for (const u of d.usb) {
+        const online = u.state === "device";
+        let action;
+        if (u.busy) {
+          action = '<span class="spinner"></span>';
+        } else if (u.onWifi) {
+          action = `<span class="tag ok" title="This phone is also connected over Wi-Fi, listed above. You can unplug the cable.">On Wi-Fi</span>`;
+        } else {
+          const tip = online
+            ? "Connects this phone over Wi-Fi too, without a QR code. Uses Wireless debugging on Android 11+, or adb tcpip if that doesn't work. The phone must be on the same Wi-Fi as this PC."
+            : u.state === "unauthorized"
+              ? "Allow USB debugging on the phone first."
+              : `The phone is ${u.state}.`;
+          action = `<button class="btn small" data-action="switch-wifi" data-target="${esc(u.serial)}" title="${esc(tip)}" ${online ? "" : "disabled"}>${icons.wifi} Switch to Wi-Fi</button>`;
+        }
+        list += `<div class="device">
+          <div class="device-icon">${icons.plug}<span class="dot ${online ? "" : "warn"}"></span></div>
+          <div class="device-info">
+            <div class="device-name">${esc(u.model || "Unknown device")}${online ? "" : `<span class="tag">${esc(u.state)}</span>`}</div>
+            <div class="device-serial" title="${esc(u.progress || u.serial)}">${esc(u.progress || u.serial)}</div>
+          </div>
+          ${action}
         </div>`;
       }
     }
@@ -288,7 +318,7 @@ function renderDevices() {
     foot += `<button class="btn danger" data-action="disconnect-all" ${idle.length ? "" : "disabled"}>Disconnect all</button>`;
   }
   if (d.otherCount > 0) {
-    foot += `<div class="note">${d.otherCount} USB or emulator device${d.otherCount === 1 ? "" : "s"} not shown.</div>`;
+    foot += `<div class="note">${d.otherCount} emulator${d.otherCount === 1 ? "" : "s"} not shown.</div>`;
   }
 
   put($("devices"), `<div class="device-scroll">${list}</div><div class="devices-foot">${foot}</div>`);
@@ -364,6 +394,9 @@ document.addEventListener("click", async (e) => {
       break;
     case "reconnect":
       await invoke("reconnect", { addrs: [target] });
+      break;
+    case "switch-wifi":
+      await invoke("switch_to_wifi", { serials: [target] });
       break;
     case "refresh":
       el.classList.remove("spin");

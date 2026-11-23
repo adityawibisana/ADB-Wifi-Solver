@@ -45,6 +45,45 @@ impl Device {
     pub fn is_wireless(&self) -> bool {
         is_mdns_serial(&self.serial) || is_ip_port(&self.serial)
     }
+
+    /// Connected over USB: anything that isn't Wi-Fi or an emulator.
+    pub fn is_usb(&self) -> bool {
+        !self.is_wireless() && !self.serial.starts_with("emulator-")
+    }
+}
+
+/// Port `adb tcpip` makes the phone listen on.
+const TCPIP_PORT: u16 = 5555;
+/// How long to wait for Wireless debugging to come up, which can include the
+/// phone asking "Allow wireless debugging on this network?".
+const WIRELESS_DEBUGGING_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether an mDNS instance name (`adb-<serialno>-<random>`) belongs to the phone with that serial number.
+pub fn instance_is_phone(instance: &str, serialno: &str) -> bool {
+    instance
+        .strip_prefix("adb-")
+        .and_then(|r| r.strip_prefix(serialno))
+        .is_some_and(|r| r.starts_with('-'))
+}
+
+/// The phone's Wi-Fi IPv4 address from `ip -o -4 addr show`.
+pub fn parse_wlan_ip(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let _index = parts.next()?;
+        let iface = parts.next()?;
+        if !iface.starts_with("wlan") || parts.next()? != "inet" {
+            return None;
+        }
+        let ip = parts.next()?.split('/').next()?;
+        ip.parse::<std::net::Ipv4Addr>().ok().map(|_| ip.to_string())
+    })
+}
+
+/// Whether `adb connect` output means it connected.
+fn connect_succeeded(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("connected to") || t.starts_with("already connected to")
 }
 
 /// Serials adb gives devices it connected to through mDNS.
@@ -243,6 +282,154 @@ impl Adb {
         } else {
             Err(text.to_string())
         }
+    }
+
+    /// Runs a shell command on a device and returns its trimmed output.
+    fn shell(&self, serial: &str, command: &str) -> Result<String, String> {
+        let out = self.run(&["-s", serial, "shell", command], Duration::from_secs(10))?;
+        if out.success {
+            Ok(out.text.trim().to_string())
+        } else {
+            Err(out.text.trim().to_string())
+        }
+    }
+
+    /// Moves a USB-connected phone to Wi-Fi without a QR code, since it
+    /// already trusts this PC over USB. Returns the Wi-Fi address and a
+    /// message saying what was done.
+    ///
+    /// On Android 11+ it turns on Wireless debugging and connects to its TLS
+    /// port. If that doesn't work it falls back to `adb tcpip`, which works
+    /// on any Android version but leaves the phone listening on port 5555
+    /// until it restarts. The USB connection keeps working either way.
+    pub fn switch_to_wifi(&self, serial: &str, status: &dyn Fn(&str)) -> Result<(String, String), String> {
+        status("Reading the phone's Wi-Fi address...");
+        let ip = parse_wlan_ip(&self.shell(serial, "ip -o -4 addr show")?)
+            .ok_or("The phone isn't connected to Wi-Fi. Connect it to the same network as this PC.")?;
+        let sdk: u32 = self.shell(serial, "getprop ro.build.version.sdk")?.parse().unwrap_or(0);
+
+        let why = if sdk >= 30 {
+            match self.switch_by_wireless_debugging(serial, &ip, status) {
+                Ok(addr) => {
+                    let msg = format!(
+                        "Switched {serial} to Wi-Fi ({addr}) with Wireless debugging. You can unplug the cable."
+                    );
+                    return Ok((addr, msg));
+                }
+                Err(e) => e,
+            }
+        } else {
+            "it needs Android 11 or newer".to_string()
+        };
+        self.note(format!("  Wireless debugging didn't work ({why}); using adb tcpip"));
+        status("Using adb tcpip instead...");
+        let addr = self.switch_by_tcpip(serial, &ip)?;
+        let msg = format!(
+            "Switched {serial} to Wi-Fi ({addr}) with adb tcpip, because Wireless debugging didn't work: {why}. \
+             You can unplug the cable. The phone accepts adb connections on port {TCPIP_PORT} until it restarts."
+        );
+        Ok((addr, msg))
+    }
+
+    /// Turns on Wireless debugging and connects to it. Turns it back off on
+    /// failure if it was off before.
+    fn switch_by_wireless_debugging(&self, serial: &str, ip: &str, status: &dyn Fn(&str)) -> Result<String, String> {
+        // The mDNS name uses the phone's serial number, which is usually the USB serial too.
+        let serialno = self.shell(serial, "getprop ro.serialno").ok().filter(|s| !s.is_empty());
+        let serialno = serialno.as_deref().unwrap_or(serial);
+        let was_on = self.shell(serial, "settings get global adb_wifi_enabled")? == "1";
+        if !was_on {
+            status("Turning on Wireless debugging...");
+            self.shell(serial, "settings put global adb_wifi_enabled 1")?;
+        }
+        let result = self.connect_wireless_debugging(serialno, ip, status);
+        if result.is_err() && !was_on {
+            let _ = self.shell(serial, "settings put global adb_wifi_enabled 0");
+        }
+        result
+    }
+
+    /// Waits for the phone's Wireless debugging service to show up over mDNS
+    /// and connects to it, unless adb connects to it on its own first (it
+    /// does for phones paired with this PC).
+    fn connect_wireless_debugging(&self, serialno: &str, ip: &str, status: &dyn Fn(&str)) -> Result<String, String> {
+        let quiet = self.quiet();
+        let start = Instant::now();
+        let mut tried: Option<String> = None;
+        while start.elapsed() < WIRELESS_DEBUGGING_WAIT {
+            if let Ok(devices) = quiet.devices() {
+                let found = devices.iter().find(|d| {
+                    // Only the Wireless debugging connection: by its mDNS name, or
+                    // the address connected to below. Not, say, an old tcpip one.
+                    d.state == "device"
+                        && (tried.as_deref() == Some(d.serial.as_str())
+                            || d.serial.strip_suffix("._adb-tls-connect._tcp").is_some_and(|i| instance_is_phone(i, serialno)))
+                });
+                if let Some(d) = found {
+                    return Ok(d.serial.clone());
+                }
+            }
+            let services = quiet.mdns_services().unwrap_or_default();
+            let mut ours = services
+                .iter()
+                .filter(|s| s.service_type.contains("_adb-tls-connect") && instance_is_phone(&s.instance, serialno));
+            let service = ours.clone().find(|s| host_of(&s.addr) == ip).or_else(|| ours.next());
+            match service {
+                Some(s) if tried.as_deref() != Some(&s.addr) => {
+                    status("Connecting...");
+                    let out = self.run(&["connect", &s.addr], Duration::from_secs(15))?;
+                    let text = out.text.trim();
+                    if !connect_succeeded(text) {
+                        return Err(format!("adb connect {} said: {text}", s.addr));
+                    }
+                    // Then wait for it to show up as `device` above.
+                    tried = Some(s.addr.clone());
+                }
+                Some(_) => {}
+                None if start.elapsed() > Duration::from_secs(3) => {
+                    status("Waiting for Wireless debugging. If the phone asks, tap Allow.");
+                }
+                None => {}
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        Err(match tried {
+            Some(addr) => format!("connected to {addr}, but the phone didn't come online"),
+            None => "it didn't come up within 30 seconds (the phone may still be asking to allow it on this network, \
+                     or mDNS is blocked on this PC)"
+                .to_string(),
+        })
+    }
+
+    /// `adb tcpip` then `adb connect ip:5555`.
+    fn switch_by_tcpip(&self, serial: &str, ip: &str) -> Result<String, String> {
+        let port = TCPIP_PORT.to_string();
+        let out = self.run(&["-s", serial, "tcpip", &port], Duration::from_secs(15))?;
+        if !out.text.contains("restarting in TCP mode") {
+            return Err(format!("adb tcpip failed: {}", out.text.trim()));
+        }
+        let addr = format!("{ip}:{port}");
+        let start = Instant::now();
+        let mut last = String::new();
+        // adbd restarts first, so the first tries may be refused.
+        while start.elapsed() < Duration::from_secs(15) {
+            thread::sleep(Duration::from_secs(1));
+            let out = self.run(&["connect", &addr], Duration::from_secs(10))?;
+            last = out.text.trim().to_string();
+            if !connect_succeeded(&last) {
+                continue;
+            }
+            let wait = Instant::now();
+            while wait.elapsed() < Duration::from_secs(5) {
+                match self.quiet().devices()?.iter().find(|d| d.serial == addr).map(|d| d.state.as_str()) {
+                    Some("device") => return Ok(addr),
+                    Some("unauthorized") => return Err(format!("{addr} is waiting for you to allow USB debugging on the phone")),
+                    _ => thread::sleep(Duration::from_millis(300)),
+                }
+            }
+            return Err(format!("connected to {addr}, but the phone didn't come online"));
+        }
+        Err(format!("could not connect to {addr} ({last}). Is this PC on the same network as the phone?"))
     }
 
     /// Ends a Wi-Fi connection and returns a message describing what was done.
@@ -549,6 +736,40 @@ mod tests {
     fn timeouts() {
         assert!(is_timeout("adb devices -l timed out"));
         assert!(!is_timeout("adb devices -l failed: oops"));
+    }
+
+    #[test]
+    fn usb_devices() {
+        let dev = |s: &str| Device { serial: s.into(), state: "device".into(), model: None };
+        assert!(dev("R9RYC00849A").is_usb());
+        assert!(!dev("emulator-5554").is_usb());
+        assert!(!dev("192.168.1.29:5555").is_usb());
+        assert!(!dev("adb-R9RYC00849A-ZxcWiN._adb-tls-connect._tcp").is_usb());
+    }
+
+    #[test]
+    fn wlan_ip() {
+        let text = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n\
+                    20: rmnet_data0    inet 10.20.30.40/30 scope global rmnet_data0\n\
+                    53: wlan0    inet 192.168.1.29/24 brd 192.168.1.255 scope global wlan0\\       valid_lft forever\n";
+        assert_eq!(parse_wlan_ip(text).as_deref(), Some("192.168.1.29"));
+        assert_eq!(parse_wlan_ip("1: lo    inet 127.0.0.1/8 scope host lo\n"), None);
+        assert_eq!(parse_wlan_ip(""), None);
+    }
+
+    #[test]
+    fn instance_names() {
+        assert!(instance_is_phone("adb-R9RYC00849A-ZxcWiN", "R9RYC00849A"));
+        assert!(!instance_is_phone("adb-R9RYC00849AB-ZxcWiN", "R9RYC00849A"));
+        assert!(!instance_is_phone("adbqr-R9RYC00849A-x", "R9RYC00849A"));
+    }
+
+    #[test]
+    fn connect_output() {
+        assert!(connect_succeeded("connected to 192.168.1.29:5555\n"));
+        assert!(connect_succeeded("already connected to 192.168.1.29:5555"));
+        assert!(!connect_succeeded("failed to connect to 192.168.1.29:5555"));
+        assert!(!connect_succeeded("cannot connect to 192.168.1.29:5555: No route to host"));
     }
 
     #[test]
