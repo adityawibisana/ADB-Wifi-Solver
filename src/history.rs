@@ -15,6 +15,10 @@ pub struct Known {
     /// Last Wireless debugging mDNS instance name (`adb-<serialno>-<random>`).
     pub guid: Option<String>,
     pub model: Option<String>,
+    /// Its name as sold, like `vivo X200 Pro`; see [`crate::adb::phone_name`].
+    pub name: Option<String>,
+    /// Android version, like `16`.
+    pub android: Option<String>,
     /// Last `ip:port` adb was connected to it at.
     pub addr: Option<String>,
     /// That address was `adb tcpip`, not Wireless debugging.
@@ -51,6 +55,8 @@ pub struct Observation {
     pub serialno: String,
     pub guid: Option<String>,
     pub model: Option<String>,
+    pub name: Option<String>,
+    pub android: Option<String>,
     pub addr: Option<String>,
     pub tcpip: bool,
     pub mac: Option<String>,
@@ -106,6 +112,12 @@ impl Store {
         }
         if o.model.is_some() {
             k.model = o.model;
+        }
+        if o.name.is_some() {
+            k.name = o.name;
+        }
+        if o.android.is_some() {
+            k.android = o.android;
         }
         if let Some(addr) = o.addr {
             k.addr = Some(addr);
@@ -272,12 +284,13 @@ mod tests {
     #[test]
     fn observes() {
         let mut s = Store::default();
-        s.observe(Observation { model: Some("Pixel 8".into()), ..seen("A", "192.168.1.20:37891", "home", Some("aa:bb:cc:dd:ee:01")) }, 10);
+        s.observe(Observation { model: Some("V2413".into()), name: Some("vivo X200 Pro".into()), ..seen("A", "192.168.1.20:37891", "home", Some("aa:bb:cc:dd:ee:01")) }, 10);
         s.observe(seen("A", "192.168.1.20:40000", "home", None), 20);
         let k = s.get("A").unwrap();
         assert_eq!(k.addr.as_deref(), Some("192.168.1.20:40000"));
         assert_eq!(k.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"), "kept: same network");
-        assert_eq!(k.model.as_deref(), Some("Pixel 8"));
+        assert_eq!(k.model.as_deref(), Some("V2413"));
+        assert_eq!(k.name.as_deref(), Some("vivo X200 Pro"), "kept when not read again");
         assert_eq!(k.last_seen, 20);
 
         s.observe(seen("A", "10.0.0.5:41000", "office", None), 30);

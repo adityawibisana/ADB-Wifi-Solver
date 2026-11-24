@@ -2,10 +2,10 @@
 //! commands the window calls. The window renders from [`Shared::snapshot`]
 //! and refetches it whenever a `changed` event arrives.
 
-use crate::adb::{self, Adb, Device, Logger, MdnsService};
+use crate::adb::{self, Adb, Device, Logger, MdnsService, PhoneInfo};
 use crate::finder::{self, Target};
 use crate::firewall;
-use crate::history::{self, Observation, Store};
+use crate::history::{self, Known, Observation, Store};
 use crate::net::{self, Network};
 use crate::pairing::{Help, Session, MAX_ATTEMPTS};
 use crate::qr;
@@ -82,6 +82,9 @@ pub struct Shared {
     paired: Mutex<HashSet<String>>,
     /// adb serial -> when its details were last read, and its serial number.
     observed: Mutex<HashMap<String, (Instant, String)>>,
+    /// What USB-connected phones say about themselves, read once per
+    /// connection: adb serial -> when it was read, and what it said.
+    usb_info: Mutex<HashMap<String, (Instant, Option<PhoneInfo>)>>,
     /// What a search for a paired phone is doing, by serial number.
     finding: Mutex<HashMap<String, String>>,
     network: Mutex<Option<Network>>,
@@ -112,6 +115,7 @@ impl Shared {
             history_path: Mutex::default(),
             paired: Mutex::default(),
             observed: Mutex::default(),
+            usb_info: Mutex::default(),
             finding: Mutex::default(),
             network: Mutex::default(),
             retry: Mutex::default(),
@@ -368,6 +372,8 @@ impl Shared {
                 serialno: info.serialno,
                 guid,
                 model: info.model.or_else(|| d.model.clone()),
+                name: info.name,
+                android: info.android,
                 addr,
                 tcpip,
                 mac,
@@ -380,6 +386,32 @@ impl Shared {
             self.save_history();
             self.changed();
         }
+    }
+
+    /// Reads the name and Android version of newly plugged-in USB phones, and
+    /// forgets unplugged ones. A phone that didn't answer is asked again later.
+    fn read_usb(&self, adb: &Adb, devices: &[Device]) {
+        let online: Vec<&Device> = devices.iter().filter(|d| d.is_usb() && d.state == "device").collect();
+        self.usb_info.lock().unwrap().retain(|serial, _| online.iter().any(|d| &d.serial == serial));
+        for d in online {
+            let due = self
+                .usb_info
+                .lock()
+                .unwrap()
+                .get(&d.serial)
+                .is_none_or(|(t, info)| info.is_none() && t.elapsed() > OBSERVE_EVERY);
+            if due {
+                let info = adb.phone_info(&d.serial).ok();
+                self.usb_info.lock().unwrap().insert(d.serial.clone(), (Instant::now(), info));
+                self.changed();
+            }
+        }
+    }
+
+    /// What the history knows about the phone with this adb serial.
+    fn known_of(&self, serial: &str) -> Option<Known> {
+        let sn = self.serialno_of(serial)?;
+        self.history.lock().unwrap().get(&sn).cloned()
     }
 
     /// Notices when this PC moves to another network.
@@ -480,8 +512,8 @@ impl Shared {
             };
             let result = finder::find(&adb, &target, true, local, &status);
             shared.finding.lock().unwrap().remove(&serialno);
-            let model = shared.history.lock().unwrap().get(&serialno).and_then(|k| k.model.clone());
-            let name = model.unwrap_or_else(|| serialno.clone());
+            let known = shared.history.lock().unwrap().get(&serialno).cloned();
+            let name = known.and_then(|k| k.name.or(k.model)).unwrap_or_else(|| serialno.clone());
             let notice = match result {
                 Ok(f) => {
                     shared.retry.lock().unwrap().remove(&serialno);
@@ -527,6 +559,7 @@ impl Shared {
         let busy = self.busy.lock().unwrap().clone();
         let progress = self.progress.lock().unwrap().clone();
         let switched = self.switched.lock().unwrap().clone();
+        let usb_info = self.usb_info.lock().unwrap().clone();
         let list = self.devices.lock().unwrap();
         let (wireless, other): (Vec<&Device>, Vec<&Device>) = list.devices.iter().partition(|d| d.is_wireless());
         let (usb, other): (Vec<&Device>, Vec<&Device>) = other.into_iter().partition(|d| d.is_usb());
@@ -537,32 +570,57 @@ impl Shared {
             error: list.error.clone(),
             wireless: wireless
                 .into_iter()
-                .map(|d| DeviceDto {
-                    serial: d.serial.clone(),
-                    model: d.model.clone(),
-                    state: d.state.clone(),
-                    mdns: adb::is_mdns_serial(&d.serial),
-                    busy: busy.contains(&d.serial),
+                .map(|d| {
+                    let k = self.known_of(&d.serial);
+                    let addr = if adb::is_ip_port(&d.serial) {
+                        Some(d.serial.clone())
+                    } else {
+                        k.as_ref().and_then(|k| k.addr.clone())
+                    };
+                    DeviceDto {
+                        serial: d.serial.clone(),
+                        model: k.as_ref().and_then(|k| k.model.clone()).or_else(|| d.model.clone()),
+                        name: k.as_ref().and_then(|k| k.name.clone()),
+                        android: k.as_ref().and_then(|k| k.android.clone()),
+                        addr,
+                        state: d.state.clone(),
+                        mdns: adb::is_mdns_serial(&d.serial),
+                        busy: busy.contains(&d.serial),
+                    }
                 })
                 .collect(),
             available: list
                 .available
                 .iter()
-                .map(|s| AvailableDto { name: s.instance.clone(), addr: s.addr.clone(), busy: busy.contains(&s.addr) })
+                .map(|s| {
+                    let k = adb::serial_of_instance(&s.instance)
+                        .and_then(|sn| self.history.lock().unwrap().get(sn).cloned());
+                    AvailableDto {
+                        name: s.instance.clone(),
+                        label: k.and_then(|k| k.name.or(k.model)),
+                        addr: s.addr.clone(),
+                        busy: busy.contains(&s.addr),
+                    }
+                })
                 .collect(),
             usb: usb
                 .into_iter()
-                .map(|d| UsbDto {
-                    serial: d.serial.clone(),
-                    model: d.model.clone(),
-                    state: d.state.clone(),
-                    busy: busy.contains(&d.serial),
-                    progress: progress.get(&d.serial).cloned(),
-                    on_wifi: online_wireless.iter().any(|w| {
-                        switched.get(&d.serial).is_some_and(|s| s == w)
-                            || w.strip_suffix("._adb-tls-connect._tcp")
-                                .is_some_and(|i| adb::instance_is_phone(i, &d.serial))
-                    }),
+                .map(|d| {
+                    let info = usb_info.get(&d.serial).and_then(|(_, i)| i.clone()).unwrap_or_default();
+                    UsbDto {
+                        serial: d.serial.clone(),
+                        model: info.model.or_else(|| d.model.clone()),
+                        name: info.name,
+                        android: info.android,
+                        state: d.state.clone(),
+                        busy: busy.contains(&d.serial),
+                        progress: progress.get(&d.serial).cloned(),
+                        on_wifi: online_wireless.iter().any(|w| {
+                            switched.get(&d.serial).is_some_and(|s| s == w)
+                                || w.strip_suffix("._adb-tls-connect._tcp")
+                                    .is_some_and(|i| adb::instance_is_phone(i, &d.serial))
+                        }),
+                    }
                 })
                 .collect(),
             other_count: other.len(),
@@ -589,6 +647,8 @@ impl Shared {
             .map(|k| KnownDto {
                 serialno: k.serialno.clone(),
                 model: k.model.clone(),
+                name: k.name.clone(),
+                android: k.android.clone(),
                 addr: k.addr.clone(),
                 last_seen: k.last_seen,
                 other_network: k.network.is_some() && network.is_some() && k.network != network,
@@ -675,6 +735,8 @@ struct DevicesDto {
 struct KnownDto {
     serialno: String,
     model: Option<String>,
+    name: Option<String>,
+    android: Option<String>,
     addr: Option<String>,
     /// Unix seconds; 0 if adbqr never saw it connected.
     last_seen: u64,
@@ -692,6 +754,10 @@ struct KnownDto {
 struct DeviceDto {
     serial: String,
     model: Option<String>,
+    name: Option<String>,
+    android: Option<String>,
+    /// Its Wi-Fi `ip:port`, if known.
+    addr: Option<String>,
     state: String,
     /// Listed by mDNS name, so Disconnect turns off Wireless debugging.
     mdns: bool,
@@ -703,6 +769,8 @@ struct DeviceDto {
 struct UsbDto {
     serial: String,
     model: Option<String>,
+    name: Option<String>,
+    android: Option<String>,
     state: String,
     busy: bool,
     /// What a switch to Wi-Fi in progress is doing.
@@ -714,6 +782,8 @@ struct UsbDto {
 #[derive(Serialize)]
 struct AvailableDto {
     name: String,
+    /// What the history calls this phone, if it connected before.
+    label: Option<String>,
     addr: String,
     busy: bool,
 }
@@ -929,6 +999,7 @@ fn spawn_device_poller(shared: Arc<Shared>) {
             let services = if result.is_ok() { adb.mdns_services().unwrap_or_default() } else { Vec::new() };
             if let Ok(devices) = &result {
                 shared.observe(&adb, devices, &services);
+                shared.read_usb(&adb, devices);
             }
             let mut list = shared.devices.lock().unwrap();
             match result {

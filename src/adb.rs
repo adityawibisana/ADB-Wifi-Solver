@@ -87,31 +87,121 @@ pub fn serial_of_instance(instance: &str) -> Option<&str> {
     (!serial.is_empty() && !random.is_empty()).then_some(serial)
 }
 
-/// What a phone connected over Wi-Fi says about itself.
+/// What a phone says about itself.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PhoneInfo {
     pub serialno: String,
+    /// `ro.product.model`, often a code like `V2413` or `SM-A075F`.
     pub model: Option<String>,
+    /// Its name as sold, like `vivo X200 Pro`, when the phone says.
+    pub name: Option<String>,
+    pub brand: Option<String>,
+    /// Android version, like `16`.
+    pub android: Option<String>,
     /// Wireless debugging's port, while it is on.
     pub tls_port: Option<u16>,
     pub wlan_ip: Option<String>,
 }
 
-const INFO_COMMAND: &str = "echo sn=$(getprop ro.serialno); echo port=$(getprop service.adb.tls.port);                             echo model=$(getprop ro.product.model); ip -o -4 addr show";
+/// Properties some makers keep the name a phone is sold as in, best first.
+const NAME_PROPS: &[&str] = &[
+    "ro.product.marketname",        // Xiaomi, Redmi, POCO
+    "ro.product.vendor.marketname", // Xiaomi, older
+    "ro.vendor.oplus.market.name",  // OPPO, OnePlus, realme
+    "ro.oppo.market.name",          // OPPO, older
+    "ro.config.marketing_name",     // Honor, Huawei
+    "ro.vivo.market.name",          // vivo, older
+    "ro.product.odm.marketname",
+];
+
+/// Settings that hold the phone's name: the maker's own first, then names the
+/// user can change, which default to the name it's sold as on many phones.
+const NAME_SETTINGS: &[(&str, &str)] =
+    &[("global", "vivo_device_name"), ("global", "device_name"), ("secure", "bluetooth_name")];
+
+/// One shell command that prints everything [`parse_phone_info`] reads, as
+/// `key=value` lines, plus `ip -o -4 addr show`.
+fn info_command() -> String {
+    let mut cmd = String::from(
+        "echo sn=$(getprop ro.serialno); echo port=$(getprop service.adb.tls.port); \
+         echo model=$(getprop ro.product.model); echo brand=$(getprop ro.product.brand); \
+         echo android=$(getprop ro.build.version.release); ",
+    );
+    for p in NAME_PROPS {
+        cmd += &format!("echo {p}=$(getprop {p}); ");
+    }
+    for (ns, key) in NAME_SETTINGS {
+        cmd += &format!("echo {ns}.{key}=$(settings get {ns} {key} 2>/dev/null); ");
+    }
+    cmd + "ip -o -4 addr show"
+}
 
 pub fn parse_phone_info(text: &str) -> PhoneInfo {
     let field = |key: &str| {
         text.lines()
-            .find_map(|l| l.trim().strip_prefix(key))
+            .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
             .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+            // `settings get` prints `null` for a setting that isn't there.
+            .filter(|v| !v.is_empty() && v != "null")
     };
+    let model = field("model");
+    let brand = field("brand");
+    let sold_as = NAME_PROPS.iter().chain(&["global.vivo_device_name"]).find_map(|p| field(p));
+    let user_set = NAME_SETTINGS[1..].iter().find_map(|(ns, key)| field(&format!("{ns}.{key}")));
     PhoneInfo {
-        serialno: field("sn=").unwrap_or_default(),
-        model: field("model="),
-        tls_port: field("port=").and_then(|p| p.parse().ok()).filter(|&p| p != 0),
+        serialno: field("sn").unwrap_or_default(),
+        name: phone_name(brand.as_deref(), model.as_deref(), sold_as.as_deref(), user_set.as_deref()),
+        model,
+        brand,
+        android: field("android"),
+        tls_port: field("port").and_then(|p| p.parse().ok()).filter(|&p| p != 0),
         wlan_ip: parse_wlan_ip(text),
     }
+}
+
+/// The name to show for a phone, or None if it says nothing better than its model.
+///
+/// `sold_as` comes from the maker and is a product name, so it gets the brand
+/// in front when it lacks it (`X200 Pro` -> `vivo X200 Pro`). `user_set` is
+/// `device_name` or `bluetooth_name`, which the user may have renamed, so it
+/// is shown as is.
+pub fn phone_name(brand: Option<&str>, model: Option<&str>, sold_as: Option<&str>, user_set: Option<&str>) -> Option<String> {
+    let model = model.unwrap_or("");
+    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    // Not a name: the model again, with or without the brand, or a generic default.
+    let useless = |n: &str| {
+        n.trim().is_empty()
+            || same(n, model)
+            || brand.is_some_and(|b| same(n, &format!("{b} {model}")))
+            || same(n, "Android")
+            || same(n, "unknown")
+    };
+    if let Some(n) = sold_as.filter(|n| !useless(n)) {
+        let n = n.trim();
+        return Some(match brand.map(brand_label) {
+            Some(b) if !b.is_empty() && !n.to_lowercase().starts_with(&b.to_lowercase()) => format!("{b} {n}"),
+            _ => n.to_string(),
+        });
+    }
+    user_set.filter(|n| !useless(n)).map(|n| n.trim().to_string())
+}
+
+/// A brand as its maker writes it: `samsung` -> `Samsung`, `oneplus` -> `OnePlus`.
+pub fn brand_label(brand: &str) -> String {
+    const KNOWN: &[&str] = &[
+        "Samsung", "Google", "Xiaomi", "Redmi", "POCO", "OnePlus", "OPPO", "realme", "vivo", "iQOO", "HONOR",
+        "HUAWEI", "Motorola", "Nothing", "Sony", "ASUS", "Nokia", "Lenovo", "ZTE", "nubia", "TECNO", "Infinix",
+        "itel", "Fairphone", "LG", "HTC", "Sharp", "Meizu", "Blackview", "Ulefone", "Doogee", "OUKITEL",
+    ];
+    let b = brand.trim();
+    if let Some(k) = KNOWN.iter().find(|k| k.eq_ignore_ascii_case(b)) {
+        return k.to_string();
+    }
+    if b.chars().all(|c| !c.is_uppercase()) {
+        let mut c = b.chars();
+        return c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+    }
+    b.to_string()
 }
 
 /// Whether `adb connect` output means it connected.
@@ -329,7 +419,7 @@ impl Adb {
     }
 
     pub fn phone_info(&self, serial: &str) -> Result<PhoneInfo, String> {
-        Ok(parse_phone_info(&self.shell(serial, INFO_COMMAND)?))
+        Ok(parse_phone_info(&self.shell(serial, &info_command())?))
     }
 
     /// Moves a USB-connected phone to Wi-Fi without a QR code, since it
@@ -836,7 +926,57 @@ port=
 model=
 ");
         assert_eq!(off, PhoneInfo { serialno: "X".into(), ..PhoneInfo::default() });
+        assert!(info_command().contains("settings get global vivo_device_name"));
         assert_eq!(parse_phone_info("port=0").tls_port, None);
+    }
+
+    #[test]
+    fn phone_info_names() {
+        // What a vivo X200 Pro prints: no name property, but vivo's own setting.
+        let vivo = "sn=10DECH0FCF00037
+port=41235
+model=V2413
+brand=vivo
+android=16
+ro.product.marketname=
+ro.vivo.market.name=
+global.vivo_device_name=vivo X200 Pro
+global.device_name=V2413
+secure.bluetooth_name=vivo X200 Pro
+";
+        let i = parse_phone_info(vivo);
+        assert_eq!(i.name.as_deref(), Some("vivo X200 Pro"));
+        assert_eq!(i.model.as_deref(), Some("V2413"));
+        assert_eq!(i.brand.as_deref(), Some("vivo"));
+        assert_eq!(i.android.as_deref(), Some("16"));
+
+        let xiaomi = "model=2311DRK48G\nbrand=POCO\nro.product.marketname=F6 Pro\nglobal.vivo_device_name=null\n";
+        assert_eq!(parse_phone_info(xiaomi).name.as_deref(), Some("POCO F6 Pro"));
+
+        let samsung = "model=SM-S928B\nbrand=samsung\nglobal.vivo_device_name=null\nglobal.device_name=Galaxy S24 Ultra\n";
+        assert_eq!(parse_phone_info(samsung).name.as_deref(), Some("Galaxy S24 Ultra"));
+
+        let pixel = "model=Pixel 8\nbrand=google\nglobal.device_name=Pixel 8\nsecure.bluetooth_name=Pixel 8\n";
+        assert_eq!(parse_phone_info(pixel).name, None, "the model already is the name");
+    }
+
+    #[test]
+    fn names() {
+        let n = |b, m, s, u| phone_name(b, m, s, u);
+        assert_eq!(n(Some("vivo"), Some("V2413"), Some("X200 Pro"), None).as_deref(), Some("vivo X200 Pro"));
+        assert_eq!(n(Some("oneplus"), Some("CPH2581"), Some("OnePlus 12"), None).as_deref(), Some("OnePlus 12"));
+        assert_eq!(n(Some("samsung"), Some("SM-A075F"), None, Some("Sam's A07")).as_deref(), Some("Sam's A07"));
+        assert_eq!(n(Some("vivo"), Some("V2413"), Some("vivo V2413"), Some("Android")), None);
+        assert_eq!(n(None, None, None, None), None);
+    }
+
+    #[test]
+    fn brands() {
+        assert_eq!(brand_label("samsung"), "Samsung");
+        assert_eq!(brand_label("oneplus"), "OnePlus");
+        assert_eq!(brand_label("vivo"), "vivo");
+        assert_eq!(brand_label("acme"), "Acme");
+        assert_eq!(brand_label("ACME"), "ACME");
     }
 
     #[test]

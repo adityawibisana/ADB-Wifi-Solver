@@ -400,8 +400,8 @@ function renderDevices() {
         list += `<div class="device">
           <div class="device-icon">${icons.phone}<span class="dot ${online ? "" : "warn"}"></span></div>
           <div class="device-info">
-            <div class="device-name">${esc(dev.model || "Unknown device")}${online ? "" : `<span class="tag">${esc(dev.state)}</span>`}</div>
-            <div class="device-serial" title="${esc(dev.serial)}">${esc(dev.serial)}</div>
+            <div class="device-name" title="${esc(nameTip(dev, dev.serial))}">${esc(deviceTitle(dev))}${online ? "" : `<span class="tag">${esc(dev.state)}</span>`}</div>
+            <div class="device-serial ${specs(dev).length ? "specs" : ""}" title="${esc(detail([dev.addr, dev.serial], dev.serial))}">${esc(detail(specs(dev), dev.addr || dev.serial))}</div>
           </div>
           ${dev.busy ? '<span class="spinner"></span>' : `<button class="btn small danger" data-action="disconnect" data-target="${esc(dev.serial)}" title="${esc(tip)}">Disconnect</button>`}
         </div>`;
@@ -413,7 +413,7 @@ function renderDevices() {
         list += `<div class="device">
           <div class="device-icon">${icons.phone}<span class="dot off"></span></div>
           <div class="device-info">
-            <div class="device-name" title="${esc(s.name)}">${esc(phoneName(s.name))}</div>
+            <div class="device-name" title="${esc(s.name)}">${esc(s.label || phoneName(s.name))}</div>
             <div class="device-serial">${esc(s.addr)}</div>
           </div>
           ${s.busy ? '<span class="spinner"></span>' : `<button class="btn small" data-action="reconnect" data-target="${esc(s.addr)}" title="Runs adb connect for this address. Works without a QR code if the phone was paired with this PC before.">Reconnect</button>`}
@@ -436,7 +436,7 @@ function renderDevices() {
         list += `<div class="device">
           <div class="device-icon">${icons.phone}<span class="dot off"></span></div>
           <div class="device-info">
-            <div class="device-name" title="${esc(k.serialno)}">${esc(k.model || k.serialno)}${tag}</div>
+            <div class="device-name" title="${esc(nameTip(k, k.serialno))}">${esc(deviceTitle(k, k.serialno))}${tag}</div>
             <div class="device-serial" title="${esc(k.progress || knownDetail(k))}">${esc(k.progress || knownDetail(k))}</div>
           </div>
           ${action}
@@ -463,8 +463,8 @@ function renderDevices() {
         list += `<div class="device">
           <div class="device-icon">${icons.plug}<span class="dot ${online ? "" : "warn"}"></span></div>
           <div class="device-info">
-            <div class="device-name">${esc(u.model || "Unknown device")}${online ? "" : `<span class="tag">${esc(u.state)}</span>`}</div>
-            <div class="device-serial" title="${esc(u.progress || u.serial)}">${esc(u.progress || u.serial)}</div>
+            <div class="device-name" title="${esc(nameTip(u, u.serial))}">${esc(deviceTitle(u))}${online ? "" : `<span class="tag">${esc(u.state)}</span>`}</div>
+            <div class="device-serial ${!u.progress && specs(u).length ? "specs" : ""}" title="${esc(u.progress || u.serial)}">${esc(u.progress || detail(specs(u), u.serial))}</div>
           </div>
           ${action}
         </div>`;
@@ -490,6 +490,29 @@ function renderDevices() {
   }
 
   put($("devices"), `<div class="device-scroll">${list}</div><div class="devices-foot">${foot}</div>`);
+}
+
+/** A phone's name, like "vivo X200 Pro", else its model code. */
+function deviceTitle(p, fallback = "Unknown device") {
+  return p.name || p.model || fallback;
+}
+
+/** ["V2413", "Android 16"]: the model code when the title is the name, and the Android version. */
+function specs(p) {
+  const parts = [];
+  if (p.name && p.model) parts.push(p.model);
+  if (p.android) parts.push(`Android ${p.android}`);
+  return parts;
+}
+
+/** The parts that are set, joined with " · ", or `fallback` if none are. */
+function detail(parts, fallback) {
+  return parts.filter(Boolean).join(" · ") || fallback;
+}
+
+/** Hover text for a phone's name: its model, Android version and serial. */
+function nameTip(p, serial) {
+  return detail([p.name && p.model ? `${p.name} (${p.model})` : null, p.android && `Android ${p.android}`, serial], serial);
 }
 
 /** "192.168.1.20:37891 · 3 h ago", or why there's no address. */

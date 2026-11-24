@@ -127,12 +127,8 @@ impl Worker {
         let (phone_ip, guid) = self.pair()?;
         let serial = self.connect(&phone_ip, guid.as_deref())?;
 
-        let model = self
-            .adb
-            .run(&["-s", &serial, "shell", "getprop", "ro.product.model"], Duration::from_secs(10))
-            .map(|o| o.text.trim().to_string())
-            .unwrap_or_default();
-        Ok(if model.is_empty() { serial } else { format!("{model} ({serial})") })
+        let name = self.adb.phone_info(&serial).ok().and_then(|i| i.name.or(i.model)).unwrap_or_default();
+        Ok(if name.is_empty() { serial } else { format!("{name} ({serial})") })
     }
 
     fn start_server(&self) -> Result<(), String> {

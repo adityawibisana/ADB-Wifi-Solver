@@ -201,7 +201,7 @@ button:disabled { cursor: default; opacity: 0.5; }
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
   gap: 14px;
   padding: 14px 18px;
 }
@@ -510,6 +510,8 @@ details.fw-step > :not(summary) { margin-top: 10px; }
 .device-info { flex: 1; min-width: 0; }
 .device-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .device-serial { color: var(--muted); font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+/* Model code and Android version: not a serial, and set in the UI font so it fits beside a wide button. */
+.device-serial.specs { font-family: inherit; font-size: 11.5px; }
 .tag { margin-left: 6px; padding: 1px 6px; border-radius: 5px; background: var(--warn-soft); color: var(--warn); font-size: 11px; font-weight: 600; }
 .tag.ok { background: var(--accent-soft); color: var(--accent-text); white-space: nowrap; }
 

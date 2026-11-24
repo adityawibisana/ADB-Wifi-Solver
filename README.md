@@ -10,22 +10,34 @@ Android Studio is somehow.... Sometimes works, sometimes doesn't work at all. So
 
 1. On the phone: **Developer options > Wireless debugging > Pair device with QR code**.
 2. Open adbqr. A QR code is shown right away.
-3. Scan it. adbqr pairs, connects, and shows **Connected** with the phone's name and address, for example `Pixel 8 (192.168.1.20:37891)`.
+3. Scan it. adbqr pairs, connects, and shows **Connected** with the phone's name and address, for example `vivo X200 Pro (192.168.1.20:37891)`.
 
 Each QR code is valid for the scan timeout (120 seconds by default), and a bar under the steps counts down. If pairing fails, a new QR code is generated and tried again, 3 attempts in total. When a code expires, click **Show new QR code**; the **Scan timeout** next to it sets how long the next code stays valid:
 
 ![The QR code expired, with a Show new QR code button](docs/expired.png)
 
+### Phone names
+
+Each phone is listed by the name it's sold as, like **vivo X200 Pro** or **Galaxy S23 Ultra**, with its model code and Android version underneath (`V2413 · Android 16`). Many phones report only a model code to adb, so adbqr asks the phone for its name once a minute (and once for a phone plugged in over USB), checking in turn:
+
+1. the name properties some makers set (`ro.product.marketname` on Xiaomi, Redmi and POCO, `ro.vendor.oplus.market.name` on OPPO, OnePlus and realme, `ro.config.marketing_name` on Honor and Huawei) and vivo's `vivo_device_name` setting, with the brand added in front if it's missing;
+2. the phone's **Device name** (Settings > About phone), which is the name it's sold as on Samsung and many others;
+3. its Bluetooth name.
+
+The last two can be renamed by the phone's owner, so a phone may show up as, say, *Sam's phone*. A phone whose model already is its name (Pixel, Motorola) is shown by model. Hover a name for the model code and serial number. Names are kept with the remembered phones, so phones under **Paired before** keep theirs.
+
 ### Disconnecting Wi-Fi devices
 
 The **Devices** panel lists every device adb is connected to over Wi-Fi under **Connected over Wi-Fi**, and refreshes every 2 seconds. Phones on a USB cable are listed under **Connected over USB** (see below); emulators are not listed. **Disconnect** ends a device's connection, and **Disconnect all** does it for every listed device.
 
-- Devices listed by address (`192.168.1.20:37891`) are disconnected with `adb disconnect`.
-- Devices listed by mDNS name (`adb-XXXX._adb-tls-connect._tcp`) can't be disconnected that way: `adb disconnect` only takes an address, and adb reconnects paired phones it finds on the network by itself. For these, adbqr turns off **Wireless debugging** on the phone, which drops the connection and keeps it dropped. Turn it back on in Developer options to reconnect; the pairing is kept.
+Hover the line under a device's name to see how adb is connected to it:
+
+- Devices connected by address (`192.168.1.20:37891`) are disconnected with `adb disconnect`.
+- Devices connected by mDNS name (`adb-XXXX._adb-tls-connect._tcp`) can't be disconnected that way: `adb disconnect` only takes an address, and adb reconnects paired phones it finds on the network by itself. For these, adbqr turns off **Wireless debugging** on the phone, which drops the connection and keeps it dropped. Turn it back on in Developer options to reconnect; the pairing is kept.
 
 ### Reconnecting without a QR code
 
-Pairing is kept, so a phone only needs the QR code once per PC. Under **Available on Wi-Fi**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb, by serial number (hover for the full mDNS name). **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
+Pairing is kept, so a phone only needs the QR code once per PC. Under **Available on Wi-Fi**, the panel lists phones on the network that have Wireless debugging on but aren't connected to adb: by name if adbqr has seen the phone before, otherwise by serial number (hover for the full mDNS name). **Reconnect** runs `adb connect` for that phone's address. This works without scanning only for phones paired with this PC before; other phones refuse the connection and need the QR code.
 
 A phone with Wireless debugging off can't be reached from the PC. That includes phones disconnected by turning it off, and phones that changed Wi-Fi network or rebooted, since Android turns it off then. Turn it back on in Developer options, and the phone shows up under **Available on Wi-Fi** (or adb reconnects it on its own).
 
