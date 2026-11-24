@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.0 - 2026-11-24
+
+- Update screenshots for the Devices panel and USB switch (b48200c)
+- Add vscode launch config (0cb2565)
+- Switch USB-connected phones to Wi-Fi without a QR code (6c6f43c)
+
 ## v0.3.0 - 2026-11-20
 
 - Move the UI from egui to Tauri (050d43f)
