@@ -217,6 +217,10 @@ impl<C: Connector> Search<'_, C> {
             }
             _ => return Ok(None),
         }
+        // adb may have connected it over mDNS on its own since the search began.
+        if let Some(serial) = mdns_serial(&self.c.devices(), &self.t.serialno) {
+            return Ok(Some(Found { serial, how: "over mDNS" }));
+        }
         let a = addr.to_string();
         let text = self.c.connect(&a)?;
         if !adb::connect_succeeded(&text) {
@@ -232,13 +236,13 @@ impl<C: Connector> Search<'_, C> {
         let start = Instant::now();
         loop {
             let devices = self.c.devices();
-            // adb may have connected it through mDNS at the same moment.
-            let by_mdns = devices.iter().find(|d| {
-                d.state == "device"
-                    && d.serial.strip_suffix("._adb-tls-connect._tcp").is_some_and(|i| adb::instance_is_phone(i, serialno))
-            });
-            if let Some(d) = by_mdns {
-                return Ok(Some(Found { serial: d.serial.clone(), how }));
+            // adb may have connected it through mDNS at the same moment. Then
+            // drop ours, or the phone is listed twice and plain `adb shell`
+            // fails with "more than one device".
+            if let Some(serial) = mdns_serial(&devices, serialno) {
+                self.c.note(format!("  adb also connected it over mDNS as {serial}; disconnecting {a}"));
+                self.c.disconnect(&a);
+                return Ok(Some(Found { serial, how }));
             }
             match devices.iter().find(|d| d.serial == a).map(|d| d.state.as_str()) {
                 Some("device") => break,
@@ -264,6 +268,17 @@ impl<C: Connector> Search<'_, C> {
     }
 }
 
+/// The serial adb lists the phone by if adb connected it over mDNS itself.
+fn mdns_serial(devices: &[Device], serialno: &str) -> Option<String> {
+    devices
+        .iter()
+        .find(|d| {
+            d.state == "device"
+                && d.serial.strip_suffix("._adb-tls-connect._tcp").is_some_and(|i| adb::instance_is_phone(i, serialno))
+        })
+        .map(|d| d.serial.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +292,8 @@ mod tests {
         phones: Vec<(String, String)>,
         connected: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
+        /// adb's own mDNS connection, made at the same moment as any `adb connect`.
+        mdns_on_connect: Option<String>,
     }
 
     impl FakeAdb {
@@ -285,6 +302,7 @@ mod tests {
                 phones: phones.iter().map(|(a, s)| (a.to_string(), s.to_string())).collect(),
                 connected: Mutex::default(),
                 calls: Mutex::default(),
+                mdns_on_connect: None,
             }
         }
         fn calls(&self) -> Vec<String> {
@@ -296,7 +314,9 @@ mod tests {
         fn connect(&self, addr: &str) -> Result<String, String> {
             self.calls.lock().unwrap().push(format!("connect {addr}"));
             if self.phones.iter().any(|(a, _)| a == addr) {
-                self.connected.lock().unwrap().push(addr.to_string());
+                let mut connected = self.connected.lock().unwrap();
+                connected.push(addr.to_string());
+                connected.extend(self.mdns_on_connect.clone());
                 Ok(format!("connected to {addr}"))
             } else {
                 Ok(format!("failed to connect to {addr}"))
@@ -350,6 +370,32 @@ mod tests {
         let f = find_with(&adb, &target(&adbd.to_string()), &[], None, &|_| {}).unwrap();
         assert_eq!(f, Found { serial: adbd.to_string(), how: "at its last address" });
         assert_eq!(adb.calls(), [format!("connect {adbd}")]);
+    }
+
+    /// adb connects the phone over mDNS while our `adb connect` runs: the
+    /// search keeps adb's connection and drops its own, so it's listed once.
+    #[test]
+    fn drops_duplicate_when_adb_connects_over_mdns() {
+        let adbd = fake_adbd();
+        let mdns = "adb-R5CT1234-AbCdEf._adb-tls-connect._tcp".to_string();
+        let mut adb = FakeAdb::new(&[(&adbd.to_string(), "R5CT1234")]);
+        adb.mdns_on_connect = Some(mdns.clone());
+        let f = find_with(&adb, &target(&adbd.to_string()), &[], None, &|_| {}).unwrap();
+        assert_eq!(f, Found { serial: mdns.clone(), how: "at its last address" });
+        assert_eq!(adb.calls(), [format!("connect {adbd}"), format!("disconnect {adbd}")]);
+        assert_eq!(*adb.connected.lock().unwrap(), [mdns]);
+    }
+
+    /// Already connected over mDNS by adb: no `adb connect` at all.
+    #[test]
+    fn skips_connect_when_already_connected_over_mdns() {
+        let adbd = fake_adbd();
+        let adb = FakeAdb::new(&[(&adbd.to_string(), "R5CT1234")]);
+        let mdns = "adb-R5CT1234-AbCdEf._adb-tls-connect._tcp".to_string();
+        adb.connected.lock().unwrap().push(mdns.clone());
+        let f = find_with(&adb, &target(&adbd.to_string()), &[], None, &|_| {}).unwrap();
+        assert_eq!(f, Found { serial: mdns, how: "over mDNS" });
+        assert!(adb.calls().is_empty());
     }
 
     /// Wireless debugging came back on another port: the quick search gives

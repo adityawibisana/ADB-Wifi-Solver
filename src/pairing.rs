@@ -1,7 +1,7 @@
 //! Pairing and connecting a phone on a background thread.
 
 use crate::adb::{self, Adb};
-use crate::qr;
+use crate::{mdns, qr};
 use rand::{distributions::Alphanumeric, Rng};
 use std::collections::HashSet;
 use std::net::UdpSocket;
@@ -14,8 +14,24 @@ const POLL: Duration = Duration::from_millis(500);
 pub const MAX_ATTEMPTS: u32 = 3;
 const FIREWALL_HINT_AFTER: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to rely on adb's mDNS alone after pairing before also asking
+/// the phone directly, and how often to ask it after that.
+const OWN_MDNS_AFTER: Duration = Duration::from_secs(4);
+const OWN_MDNS_EVERY: Duration = Duration::from_secs(3);
+const OWN_MDNS_WAIT: Duration = Duration::from_millis(1500);
+const STUCK_MDNS: &str = "adb sees the phone but not its address, so it can't pair. Restarting the adb server                           usually fixes this.";
 pub const SERVER_HUNG: &str = "The adb server isn't responding. Restart it with \"Restart adb server\" at the top, \
                                then try again.";
+
+/// Help the UI can offer with a warning or a failure.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Help {
+    /// Let adb through Windows Defender Firewall.
+    Firewall,
+    /// adb's mDNS is stuck; restarting the adb server fixes it.
+    RestartServer,
+}
 
 /// What the UI shows while a pairing session runs.
 #[derive(Default)]
@@ -27,6 +43,8 @@ pub struct Progress {
     pub deadline: Option<Instant>,
     pub status: String,
     pub warning: Option<String>,
+    /// What the UI offers next to the warning or the failure.
+    pub help: Option<Help>,
     /// The QR code timed out without being scanned.
     pub expired: bool,
     /// Set once the session ends: the connected device, or why it failed.
@@ -143,7 +161,8 @@ impl Worker {
                     "adb reports mDNS is unavailable, so the phone may not be found. \
                      Update platform-tools to version 34 or newer."
                         .into(),
-                )
+                );
+                p.help = None;
             }),
         }
     }
@@ -183,7 +202,10 @@ impl Worker {
                 Err(e) => last_error = e,
             }
             self.check_cancel()?;
-            self.update(|p| p.warning = Some(format!("Pairing failed: {last_error}")));
+            self.update(|p| {
+                p.warning = Some(format!("Pairing failed: {last_error}"));
+                p.help = None;
+            });
         }
         Err(format!("Pairing failed after {MAX_ATTEMPTS} attempts: {last_error}"))
     }
@@ -197,6 +219,7 @@ impl Worker {
             p.status = "Waiting for the phone to scan the QR code...".into();
         });
         let mut hinted = false;
+        let mut stuck_hinted = false;
         let mut mdns_checked = !check_mdns;
         loop {
             self.check_cancel()?;
@@ -205,7 +228,22 @@ impl Worker {
                     .iter()
                     .find(|s| s.instance == name && s.service_type.contains("_adb-tls-pairing"))
                 {
-                    return Ok(s.addr.clone());
+                    if !unspecified(&s.addr) {
+                        return Ok(s.addr.clone());
+                    }
+                    // adb heard the phone but lost its IP (seen as 0.0.0.0 on PCs with
+                    // several network adapters). Ask the phone directly instead.
+                    if let Some(addr) = self.resolve_pairing(name, &s.addr) {
+                        return Ok(addr);
+                    }
+                    if !stuck_hinted {
+                        stuck_hinted = true;
+                        hinted = true; // this explains the wait better than the firewall hint
+                        self.update(|p| {
+                            p.warning = Some(STUCK_MDNS.into());
+                            p.help = Some(Help::RestartServer);
+                        });
+                    }
                 }
             }
             if !mdns_checked {
@@ -220,7 +258,8 @@ impl Worker {
                         "Still waiting. If you already scanned, check that your firewall \
                          allows adb on this network (mDNS uses UDP 5353)."
                             .into(),
-                    )
+                    );
+                    p.help = Some(Help::Firewall);
                 });
             }
             if elapsed > self.timeout {
@@ -231,6 +270,18 @@ impl Worker {
         }
     }
 
+    /// Finds the pairing service's real address with this app's own mDNS client.
+    fn resolve_pairing(&self, name: &str, bad: &str) -> Option<String> {
+        self.adb.note(format!("  adb reported the pairing service at {bad}; asking the phone directly"));
+        let found = mdns::query_service(mdns::PAIRING, &[], &[name.to_string()], OWN_MDNS_WAIT);
+        let addr = found.into_iter().find(|(i, _)| i == name).map(|(_, a)| a.to_string());
+        match &addr {
+            Some(a) => self.adb.note(format!("  the phone answered from {a}")),
+            None => self.adb.note("  no answer; still waiting".into()),
+        }
+        addr
+    }
+
     /// Waits for the paired phone to appear in `adb devices`, connecting it if adb doesn't.
     fn connect(&self, ip: &str, guid: Option<&str>) -> Result<String, String> {
         let matches = |serial: &str| {
@@ -239,35 +290,84 @@ impl Worker {
         let start = Instant::now();
         let mut tried = HashSet::new();
         let mut last_error = String::from("the phone never advertised its connection service");
+        let mut next_own_query = start + OWN_MDNS_AFTER;
+        let phone_ip: Option<std::net::Ipv4Addr> = ip.parse().ok();
 
         loop {
             self.check_cancel()?;
             if let Ok(devices) = self.adb.quiet().devices() {
-                if let Some(d) = devices.iter().find(|d| d.state == "device" && matches(&d.serial)) {
-                    return Ok(d.serial.clone());
+                let mine: Vec<&str> =
+                    devices.iter().filter(|d| d.state == "device" && matches(&d.serial)).map(|d| d.serial.as_str()).collect();
+                // adb may connect it over mDNS while we connect by address. Keep
+                // adb's and drop ours, or the phone is listed twice.
+                let by_mdns = mine.iter().find(|s| guid.is_some_and(|g| s.contains(g)));
+                if let Some(keep) = by_mdns.or(mine.first()) {
+                    for other in mine.iter().filter(|s| *s != keep && tried.contains(**s)) {
+                        self.adb.note(format!("  adb also connected it as {keep}; disconnecting {other}"));
+                        let _ = self.adb.run(&["disconnect", other], Duration::from_secs(5));
+                    }
+                    return Ok(keep.to_string());
                 }
             }
+            let mut candidates: Vec<String> = Vec::new();
             if let Ok(services) = self.adb.quiet().mdns_services() {
                 for s in services.iter().filter(|s| {
                     s.service_type.contains("_adb-tls-connect")
                         && (adb::host_of(&s.addr) == ip || guid == Some(s.instance.as_str()))
                 }) {
-                    if tried.insert(s.addr.clone()) {
-                        self.status(format!("Connecting to {}...", s.addr));
-                        match self.adb.run(&["connect", &s.addr], Duration::from_secs(15)) {
-                            Ok(out) if out.text.contains("connected to") => {}
-                            Ok(out) => last_error = out.text.trim().to_string(),
-                            Err(e) => last_error = e,
-                        }
+                    // An unspecified host is adb losing the IP; the port is still right.
+                    candidates.push(if unspecified(&s.addr) { with_host(&s.addr, ip) } else { s.addr.clone() });
+                }
+            }
+            // adb's mDNS sometimes never shows the connect service. Ask the phone too.
+            if candidates.is_empty() && Instant::now() >= next_own_query {
+                next_own_query = Instant::now() + OWN_MDNS_EVERY;
+                let hosts: Vec<std::net::Ipv4Addr> = phone_ip.into_iter().collect();
+                let instances: Vec<String> = guid.map(str::to_string).into_iter().collect();
+                let found = mdns::query(&hosts, &instances, OWN_MDNS_WAIT);
+                let mine: Vec<String> = found
+                    .into_iter()
+                    .filter(|(i, a)| guid == Some(i.as_str()) || Some(*a.ip()) == phone_ip)
+                    .map(|(_, a)| a.to_string())
+                    .collect();
+                self.adb.note(format!("  asked the phone over mDNS for its connect port: {mine:?}"));
+                candidates.extend(mine);
+            }
+            for addr in candidates {
+                if tried.insert(addr.clone()) {
+                    self.status(format!("Connecting to {addr}..."));
+                    match self.adb.run(&["connect", &addr], Duration::from_secs(15)) {
+                        Ok(out) if out.text.contains("connected to") => {}
+                        Ok(out) => last_error = out.text.trim().to_string(),
+                        Err(e) => last_error = e,
                     }
                 }
             }
             if start.elapsed() > CONNECT_TIMEOUT {
-                return Err(format!("Paired, but could not connect: {last_error}"));
+                // Paired, so the network and firewall are fine; adb's mDNS is the likely culprit.
+                self.update(|p| p.help = Some(Help::RestartServer));
+                return Err(format!(
+                    "Paired, but could not connect: {last_error}. Restarting the adb server usually fixes this;                      then use Reconnect, or pair again."
+                ));
             }
             sleep(POLL);
         }
     }
+}
+
+/// Whether an `ip:port` has no real host (`0.0.0.0` or `[::]`).
+fn unspecified(addr: &str) -> bool {
+    adb::host_of(addr)
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// `addr` with its host replaced by `host`.
+fn with_host(addr: &str, host: &str) -> String {
+    let port = addr.rsplit_once(':').map_or("", |(_, p)| p);
+    format!("{host}:{port}")
 }
 
 fn timeout_hint(timeout: Duration) -> String {
@@ -290,4 +390,17 @@ fn local_ip() -> Option<String> {
 
 fn random_alnum(len: usize) -> String {
     rand::thread_rng().sample_iter(&Alphanumeric).take(len).map(char::from).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spots_unspecified_hosts() {
+        assert!(unspecified("0.0.0.0:45717"));
+        assert!(unspecified("[::]:45717"));
+        assert!(!unspecified("192.168.1.52:45717"));
+        assert_eq!(with_host("0.0.0.0:40123", "192.168.1.52"), "192.168.1.52:40123");
+    }
 }

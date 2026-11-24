@@ -4,9 +4,10 @@
 
 use crate::adb::{self, Adb, Device, Logger, MdnsService};
 use crate::finder::{self, Target};
+use crate::firewall;
 use crate::history::{self, Observation, Store};
 use crate::net::{self, Network};
-use crate::pairing::{Session, MAX_ATTEMPTS};
+use crate::pairing::{Help, Session, MAX_ATTEMPTS};
 use crate::qr;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -137,6 +138,9 @@ impl Shared {
     }
 
     fn log(&self, line: String) {
+        // Debug builds also print the log, so it can be followed from a terminal.
+        #[cfg(debug_assertions)]
+        eprintln!("[adbqr] {line}");
         let mut log = self.log.lock().unwrap();
         if log.lines.len() >= LOG_LINES {
             log.lines.pop_front();
@@ -511,6 +515,7 @@ impl Shared {
                 expires_in_ms: p.deadline.map(|d| d.saturating_duration_since(Instant::now()).as_millis() as u64),
                 status: p.status.clone(),
                 warning: p.warning.clone(),
+                help: p.help,
                 expired: p.expired,
                 outcome: p.outcome.as_ref().map(|o| match o {
                     Ok(device) => OutcomeDto { ok: true, text: device.clone() },
@@ -597,6 +602,7 @@ impl Shared {
         drop(h);
 
         Snapshot {
+            os: std::env::consts::OS,
             adb_path,
             adb_error,
             timeout_secs: self.timeout_secs.load(Ordering::Relaxed),
@@ -615,6 +621,8 @@ fn notice_dto((text, failed): &(String, bool)) -> NoticeDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// `windows`, `linux`, `macos`, ...: the firewall help is Windows only.
+    os: &'static str,
     adb_path: Option<String>,
     adb_error: Option<String>,
     timeout_secs: u64,
@@ -634,6 +642,8 @@ struct PairingDto {
     expires_in_ms: Option<u64>,
     status: String,
     warning: Option<String>,
+    /// Help offered with the warning or the failure: `firewall` or `restartServer`.
+    help: Option<Help>,
     expired: bool,
     outcome: Option<OutcomeDto>,
 }
@@ -854,6 +864,37 @@ pub fn dismiss_notice(shared: S, which: String) {
         _ => *shared.notice.lock().unwrap() = None,
     }
     shared.changed();
+}
+
+/// Opens a Windows settings page: `"firewall"` or `"network"`.
+#[tauri::command]
+pub fn open_settings(page: String) -> Result<(), String> {
+    firewall::open_settings(&page)
+}
+
+/// The networks Windows is connected to and whether each is Public or Private.
+#[tauri::command]
+pub async fn firewall_networks() -> Result<Vec<firewall::Network>, String> {
+    tauri::async_runtime::spawn_blocking(firewall::networks).await.map_err(|e| e.to_string())?
+}
+
+/// Lets the current adb through Windows Defender Firewall (asks for admin rights).
+#[tauri::command]
+pub async fn fix_firewall(shared: S<'_>) -> Result<String, String> {
+    let path = match &*shared.adb.lock().unwrap() {
+        Ok(adb) => adb.path().to_path_buf(),
+        Err(_) => return Err("adb not found, so there's nothing to allow yet.".into()),
+    };
+    let s = shared.inner().clone();
+    s.log(format!("firewall: allowing {}", path.display()));
+    let result = tauri::async_runtime::spawn_blocking(move || firewall::allow(&path))
+        .await
+        .map_err(|e| e.to_string())?;
+    match &result {
+        Ok(msg) => s.log(format!("firewall: {msg}")),
+        Err(e) => s.log(format!("firewall: {e}")),
+    }
+    result
 }
 
 /// Sends `changed` to the window when something changed, at most every [`EMIT_INTERVAL`].

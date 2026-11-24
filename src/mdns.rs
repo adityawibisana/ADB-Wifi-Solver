@@ -11,6 +11,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
 pub const SERVICE: &str = "_adb-tls-connect._tcp.local";
+/// What a phone advertises while it shows "Pair device with QR code".
+pub const PAIRING: &str = "_adb-tls-pairing._tcp.local";
 const GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const PORT: u16 = 5353;
 
@@ -123,8 +125,8 @@ pub fn parse_response(buf: &[u8]) -> Option<Vec<Record>> {
     Some(out)
 }
 
-fn instance_of(name: &str) -> Option<&str> {
-    let suffix = format!(".{SERVICE}");
+fn instance_of<'a>(name: &'a str, service: &str) -> Option<&'a str> {
+    let suffix = format!(".{service}");
     let cut = name.len().checked_sub(suffix.len())?;
     (name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(&suffix)).then(|| &name[..cut])
 }
@@ -132,11 +134,11 @@ fn instance_of(name: &str) -> Option<&str> {
 /// Wireless debugging services in one response: instance name and address.
 /// The address comes from the A record for the SRV target, or else from
 /// who sent the response.
-pub fn services(records: &[Record], from: Ipv4Addr) -> Vec<(String, SocketAddrV4)> {
+fn services(records: &[Record], from: Ipv4Addr, service: &str) -> Vec<(String, SocketAddrV4)> {
     let mut out = Vec::new();
     for r in records {
         let Data::Srv { port, target } = &r.data else { continue };
-        let Some(instance) = instance_of(&r.name) else { continue };
+        let Some(instance) = instance_of(&r.name, service) else { continue };
         let ip = records
             .iter()
             .find_map(|a| match &a.data {
@@ -153,12 +155,12 @@ pub fn services(records: &[Record], from: Ipv4Addr) -> Vec<(String, SocketAddrV4
 }
 
 /// Instances named by PTR records, whose SRV may not have come along.
-fn pointed(records: &[Record]) -> Vec<String> {
+fn pointed(records: &[Record], service: &str) -> Vec<String> {
     records
         .iter()
-        .filter(|r| r.name.eq_ignore_ascii_case(SERVICE))
+        .filter(|r| r.name.eq_ignore_ascii_case(service))
         .filter_map(|r| match &r.data {
-            Data::Ptr(n) => instance_of(n).map(str::to_string),
+            Data::Ptr(n) => instance_of(n, service).map(str::to_string),
             _ => None,
         })
         .collect()
@@ -169,12 +171,17 @@ fn pointed(records: &[Record]) -> Vec<String> {
 /// answers for `wait`. Instances only named in a PTR answer are asked for
 /// again by name.
 pub fn query(hosts: &[Ipv4Addr], instances: &[String], wait: Duration) -> Vec<(String, SocketAddrV4)> {
-    let mut dests = vec![SocketAddr::V4(SocketAddrV4::new(GROUP, PORT))];
-    dests.extend(hosts.iter().map(|h| SocketAddr::V4(SocketAddrV4::new(*h, PORT))));
-    query_to(&dests, instances, wait)
+    query_service(SERVICE, hosts, instances, wait)
 }
 
-fn query_to(dests: &[SocketAddr], instances: &[String], wait: Duration) -> Vec<(String, SocketAddrV4)> {
+/// [`query`] for another service type, such as [`PAIRING`].
+pub fn query_service(service: &str, hosts: &[Ipv4Addr], instances: &[String], wait: Duration) -> Vec<(String, SocketAddrV4)> {
+    let mut dests = vec![SocketAddr::V4(SocketAddrV4::new(GROUP, PORT))];
+    dests.extend(hosts.iter().map(|h| SocketAddr::V4(SocketAddrV4::new(*h, PORT))));
+    query_to(&dests, service, instances, wait)
+}
+
+fn query_to(dests: &[SocketAddr], service: &str, instances: &[String], wait: Duration) -> Vec<(String, SocketAddrV4)> {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -183,8 +190,8 @@ fn query_to(dests: &[SocketAddr], instances: &[String], wait: Duration) -> Vec<(
     let _ = socket.set_ttl(255);
 
     let id: u16 = rand::random();
-    let srv = |i: &str| (format!("{i}.{SERVICE}"), TYPE_SRV);
-    let mut questions: Vec<(String, u16)> = vec![(SERVICE.to_string(), TYPE_PTR)];
+    let srv = |i: &str| (format!("{i}.{service}"), TYPE_SRV);
+    let mut questions: Vec<(String, u16)> = vec![(service.to_string(), TYPE_PTR)];
     questions.extend(instances.iter().map(|i| srv(i)));
     send(&socket, dests, &build_query(id, &questions));
 
@@ -202,12 +209,12 @@ fn query_to(dests: &[SocketAddr], instances: &[String], wait: Duration) -> Vec<(
         };
         let IpAddr::V4(from) = from.ip() else { continue };
         let Some(records) = parse_response(&buf[..n]) else { continue };
-        for s in services(&records, from) {
+        for s in services(&records, from, service) {
             if !found.contains(&s) {
                 found.push(s);
             }
         }
-        let missing: Vec<String> = pointed(&records)
+        let missing: Vec<String> = pointed(&records, service)
             .into_iter()
             .filter(|i| !asked.contains(i) && !found.iter().any(|(f, _)| f == i))
             .collect();
@@ -279,9 +286,9 @@ pub mod tests {
         assert_eq!(r.len(), 3);
         assert_eq!(r[0].data, Data::Ptr(format!("adb-R5CT1234-AbCdEf.{SERVICE}")));
         assert_eq!(r[1].data, Data::Srv { port: 37891, target: "Android.local".into() });
-        let s = services(&r, Ipv4Addr::new(10, 0, 0, 9));
+        let s = services(&r, Ipv4Addr::new(10, 0, 0, 9), SERVICE);
         assert_eq!(s, [("adb-R5CT1234-AbCdEf".to_string(), SocketAddrV4::new(ip, 37891))]);
-        assert_eq!(pointed(&r), ["adb-R5CT1234-AbCdEf"]);
+        assert_eq!(pointed(&r, SERVICE), ["adb-R5CT1234-AbCdEf"]);
     }
 
     #[test]
@@ -291,7 +298,7 @@ pub mod tests {
             data: Data::Srv { port: 40000, target: "Android-2.local".into() },
         }];
         let from = Ipv4Addr::new(192, 168, 1, 30);
-        assert_eq!(services(&records, from), [("adb-X-1".to_string(), SocketAddrV4::new(from, 40000))]);
+        assert_eq!(services(&records, from, SERVICE), [("adb-X-1".to_string(), SocketAddrV4::new(from, 40000))]);
     }
 
     #[test]
@@ -319,7 +326,7 @@ pub mod tests {
             phone.send_to(&phone_response("adb-R5CT1234-AbCdEf", Ipv4Addr::LOCALHOST, 41000, true), from).unwrap();
         });
         let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-        let found = query_to(&[dest], &[], Duration::from_millis(800));
+        let found = query_to(&[dest], SERVICE, &[], Duration::from_millis(800));
         assert_eq!(found, [("adb-R5CT1234-AbCdEf".to_string(), SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41000))]);
     }
 }

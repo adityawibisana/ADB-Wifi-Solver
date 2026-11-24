@@ -4,6 +4,7 @@
 mod adb;
 mod app;
 mod finder;
+mod firewall;
 mod history;
 mod mdns;
 mod net;
@@ -46,6 +47,9 @@ fn main() {
             app::restart_server,
             app::refresh,
             app::dismiss_notice,
+            app::open_settings,
+            app::firewall_networks,
+            app::fix_firewall,
         ])
         .run(tauri::generate_context!())
         .expect("could not start adbqr");

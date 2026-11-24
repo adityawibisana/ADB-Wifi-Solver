@@ -94,7 +94,7 @@ The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). No Node.js o
 
 ## Troubleshooting
 
-- **Nothing happens after scanning.** Pairing is found over mDNS (UDP 5353). Make sure your firewall allows adb on this network. On Windows, the network should be set to *Private*.
+- **Nothing happens after scanning.** Pairing is found over mDNS (UDP 5353). Make sure your firewall allows adb on this network. On Windows, the network should be set to *Private*. When the wait drags on, adbqr shows a firewall warning; click it for step-by-step help, or **Allow adb through the firewall** to let adbqr do it. That adds an inbound rule named `adb (adbqr)` for this adb on private networks and removes rules that block adb (Windows saves those when its "allow access?" prompt is cancelled). Windows asks for administrator approval first.
 - **"mDNS is unavailable" warning.** Update platform-tools.
 - **Find can't find a paired phone.** Check that Wireless debugging is on and the phone is on the same Wi-Fi as the PC. Guest networks and some office networks stop devices from reaching each other, and then nothing on the PC can reach the phone.
 - **A disconnected phone comes back.** For phones listed by mDNS name, Disconnect turns off Wireless debugging; if it's turned back on, adb reconnects. Check the adb log for what happened.

@@ -526,7 +526,7 @@ pub fn is_timeout(err: &str) -> bool {
 }
 
 /// Don't flash a console window for every command on Windows.
-fn hide_console(command: &mut Command) {
+pub(crate) fn hide_console(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

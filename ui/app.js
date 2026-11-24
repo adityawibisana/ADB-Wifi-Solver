@@ -50,7 +50,15 @@ let lastQr = ""; // shown faded once the QR code expires
 
 /** The timeout hint ("...Check that:\n- a\n- b") as a bulleted callout. */
 function checklist(text) {
-  const items = text.split("\n").filter((l) => l.startsWith("- ")).map((l) => `<li>${esc(l.slice(2))}</li>`);
+  const items = text
+    .split("\n")
+    .filter((l) => l.startsWith("- "))
+    .map((l) => {
+      const help = firewallHelpAvailable() && l.includes("firewall")
+        ? ` <button class="inline-link" data-action="firewall-help">How?</button>`
+        : "";
+      return `<li>${esc(l.slice(2))}${help}</li>`;
+    });
   if (!items.length) return `<div class="callout info">${icons.info}<span>${esc(text)}</span></div>`;
   return `<div class="callout info">${icons.info}<div><b>If you scanned it, check that:</b><ul>${items.join("")}</ul></div></div>`;
 }
@@ -178,7 +186,7 @@ function renderPairing() {
     box = `<div class="qr-box placeholder"><div class="qr-overlay"><div class="big-icon error">${icons.alert}</div></div></div>`;
     side = `<div><p class="headline">Couldn't connect</p></div>
       <div class="callout error">${icons.alert}<span>${esc(p.outcome.text)}</span></div>
-      <div class="actions"><button class="btn primary" data-action="pair">Try again</button><button class="btn" data-action="cancel">Close</button></div>`;
+      <div class="actions">${p.help === "restartServer" ? restartButton : ""}<button class="btn primary" data-action="pair">Try again</button><button class="btn" data-action="cancel">Close</button></div>`;
   } else {
     if (p.qrSvg) {
       box = `<div class="qr-box">${p.qrSvg}</div>`;
@@ -194,7 +202,7 @@ function renderPairing() {
     side = `${p.qrSvg ? steps : ""}
       ${timer}
       <div class="status"><span class="spinner"></span><span>${esc(p.status || "Starting...")}</span></div>
-      ${p.warning ? `<div class="callout warn">${icons.alert}<span>${esc(p.warning)}</span></div>` : ""}
+      ${warningCallout(p)}
       <div class="actions"><button class="btn" data-action="cancel">Cancel</button></div>`;
   }
   if (p && p.qrSvg) lastQr = p.qrSvg;
@@ -203,6 +211,133 @@ function renderPairing() {
   const timeout = $("timeout");
   if (timeout && timeout.value === "" && document.activeElement !== timeout) timeout.value = timeoutSecs;
   tick();
+}
+
+const restartButton = `<button class="btn small" data-action="restart-server" title="Stops the adb server, forcibly if needed, and starts a new one. Android Studio and other adb tools lose their device connections for a moment and reconnect on their own.">${icons.restart} Restart adb server</button>`;
+
+/** The pairing warning, with the help it comes with: firewall steps, or restarting adb. */
+function warningCallout(p) {
+  if (!p.warning) return "";
+  if (p.help === "restartServer") {
+    return `<div class="callout warn">${icons.alert}<div><span>${esc(p.warning)}</span>
+      <div class="actions">${restartButton}</div></div></div>`;
+  }
+  if (p.help === "firewall" && firewallHelpAvailable()) {
+    return `<button class="callout warn clickable" data-action="firewall-help" title="Show how to let adb through Windows Defender Firewall">
+      ${icons.alert}<span>${esc(p.warning)}<span class="more">How to allow adb ›</span></span></button>`;
+  }
+  return `<div class="callout warn">${icons.alert}<span>${esc(p.warning)}</span></div>`;
+}
+
+// ---------- firewall help ----------
+
+let fw = { open: false, busy: false, result: null, networks: null, networksError: null, manual: false };
+
+function firewallHelpAvailable() {
+  return state && state.os === "windows";
+}
+
+async function openFirewallHelp() {
+  const dialog = $("fw-dialog");
+  fw = { open: true, busy: false, result: null, networks: null, networksError: null, manual: false };
+  renderFirewall();
+  if (!dialog.open) dialog.showModal();
+  loadNetworks();
+}
+
+async function loadNetworks() {
+  try {
+    fw.networks = await invoke("firewall_networks");
+    fw.networksError = null;
+  } catch (err) {
+    fw.networks = [];
+    fw.networksError = String(err);
+  }
+  renderFirewall();
+}
+
+function networkStatus() {
+  if (fw.networks == null) {
+    return `<div class="fw-net muted"><span class="spinner"></span><span>Checking your network...</span></div>`;
+  }
+  if (fw.networksError || !fw.networks.length) return "";
+  const publicNets = fw.networks.filter((n) => n.category === "Public");
+  if (!publicNets.length) {
+    const names = fw.networks.map((n) => `<b>${esc(n.name)}</b>`).join(", ");
+    return `<div class="fw-net ok">${icons.check}<span>${names} ${fw.networks.length > 1 ? "are" : "is"} a private network. Good.</span></div>`;
+  }
+  const names = publicNets.map((n) => `<b>${esc(n.name)}</b>`).join(", ");
+  return `<div class="callout warn">${icons.alert}<div>
+      ${names} ${publicNets.length > 1 ? "are" : "is"} set to <b>Public</b>. Windows blocks more on public networks, and the rule below
+      only covers private ones. If this is your home or office Wi-Fi, set it to <b>Private</b>: open its properties and pick
+      <i>Private network</i>.
+      <div class="actions"><button class="btn small" data-action="open-settings" data-page="network">Open network settings</button></div>
+    </div></div>`;
+}
+
+function codeBox(text) {
+  return `<div class="code"><code>${esc(text)}</code><button class="btn small ghost" data-action="copy" data-copy="${esc(text)}">Copy</button></div>`;
+}
+
+function renderFirewall() {
+  const dialog = $("fw-dialog");
+  if (!fw.open) return;
+  const adb = state && state.adbPath ? state.adbPath : "";
+  const psPath = adb.replace(/'/g, "''");
+  const command =
+    `New-NetFirewallRule -DisplayName 'adb (adbqr)' -Direction Inbound -Program '${psPath}' -Action Allow -Profile Private,Domain`;
+
+  let result = "";
+  if (fw.result) {
+    result = fw.result.ok
+      ? `<div class="callout ok">${icons.check}<span>${esc(fw.result.text)}\nIf the QR code is still up, scan it again or wait a few seconds; otherwise show a new one.</span></div>`
+      : `<div class="callout error">${icons.alert}<span>${esc(fw.result.text)}</span></div>`;
+  }
+
+  put(dialog, `
+    <div class="modal-head">
+      <h2 id="fw-title">Let adb through Windows Defender Firewall</h2>
+      <button class="icon-btn" data-action="close-firewall" title="Close">${icons.x}</button>
+    </div>
+    <div class="modal-body">
+      <p class="sub">After you scan, the phone announces itself on the network over mDNS (UDP 5353), and adb listens for it.
+        If Windows Defender Firewall blocks adb, the phone never shows up. That often happens when
+        Windows asked whether to allow adb and the prompt was cancelled: Windows then saves rules that block it.</p>
+
+      ${networkStatus()}
+
+      <section class="fw-step">
+        <h3>Fix it for me</h3>
+        <p class="sub">Adds an inbound rule that allows this adb on private networks, and removes any rules that block it.
+          Windows asks for administrator approval.</p>
+        <div class="actions">
+          <button class="btn primary" data-action="fix-firewall" ${fw.busy || !adb ? "disabled" : ""}>
+            ${fw.busy ? '<span class="spinner"></span> Waiting for approval...' : "Allow adb through the firewall"}
+          </button>
+        </div>
+        ${result}
+      </section>
+
+      <details class="fw-step" id="fw-manual" ${fw.manual ? "open" : ""}>
+        <summary><h3>Or do it yourself</h3></summary>
+        <ol class="fw-steps">
+          <li>Make sure your Wi-Fi is a <b>Private</b> network: Settings › Network &amp; internet › Wi-Fi › your network › Network profile type.</li>
+          <li>Open <b>Allow an app through firewall</b>
+            <button class="inline-link" data-action="open-settings" data-page="firewall">Open it</button>,
+            then click <b>Change settings</b>.</li>
+          <li>Look for <b>adb</b> or <b>Android Debug Bridge</b>. If an entry is unticked, tick <b>Private</b> for it.
+            If there's none, click <b>Allow another app...</b> › <b>Browse...</b>, pick this file, and tick <b>Private</b>:
+            ${adb ? codeBox(adb) : '<span class="sub">(adb not found yet)</span>'}</li>
+          <li>Still blocked? Block rules win over allow rules. In <b>Windows Defender Firewall with Advanced Security</b> ›
+            Inbound Rules, delete any <b>Block</b> rule for adb.</li>
+        </ol>
+        <p class="sub">Or run this in PowerShell as administrator:</p>
+        ${adb ? codeBox(command) : ""}
+      </details>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-action="close-firewall">Close</button>
+    </div>`);
 }
 
 /** Updates the countdown text and bar between state updates. */
@@ -479,6 +614,39 @@ document.addEventListener("click", async (e) => {
       logLines = [];
       $("log-text").textContent = "";
       break;
+    case "firewall-help":
+      openFirewallHelp();
+      return;
+    case "close-firewall":
+      $("fw-dialog").close();
+      return;
+    case "open-settings":
+      try {
+        await invoke("open_settings", { page: el.dataset.page });
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    case "fix-firewall":
+      fw.busy = true;
+      fw.result = null;
+      renderFirewall();
+      try {
+        fw.result = { ok: true, text: await invoke("fix_firewall") };
+      } catch (err) {
+        fw.result = { ok: false, text: String(err) };
+      }
+      fw.busy = false;
+      renderFirewall();
+      loadNetworks();
+      break;
+    case "copy":
+      try {
+        await navigator.clipboard.writeText(el.dataset.copy);
+        el.textContent = "Copied";
+        setTimeout(() => (el.textContent = "Copy"), 1200);
+      } catch (_) {}
+      return;
     case "copy-log":
       try {
         await navigator.clipboard.writeText(logLines.join("\n"));
@@ -498,6 +666,12 @@ document.addEventListener("change", async (e) => {
   }
 });
 
+$("fw-dialog").addEventListener("close", () => (fw.open = false));
+// Remember whether "Or do it yourself" is expanded, so a re-render keeps it.
+$("fw-dialog").addEventListener("toggle", (e) => {
+  if (e.target.id === "fw-manual") fw.manual = e.target.open;
+}, true);
+
 function render() {
   if (!state) return;
   renderAdb();
@@ -505,6 +679,7 @@ function render() {
   renderPairing();
   renderDevices();
   renderLog();
+  renderFirewall();
 }
 
 let fetching = false;
