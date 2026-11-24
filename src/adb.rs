@@ -80,8 +80,42 @@ pub fn parse_wlan_ip(text: &str) -> Option<String> {
     })
 }
 
+/// The serial number in an mDNS instance name: `adb-R5CT1234-AbCdEf` -> `R5CT1234`.
+pub fn serial_of_instance(instance: &str) -> Option<&str> {
+    let rest = instance.strip_prefix("adb-")?;
+    let (serial, random) = rest.rsplit_once('-')?;
+    (!serial.is_empty() && !random.is_empty()).then_some(serial)
+}
+
+/// What a phone connected over Wi-Fi says about itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PhoneInfo {
+    pub serialno: String,
+    pub model: Option<String>,
+    /// Wireless debugging's port, while it is on.
+    pub tls_port: Option<u16>,
+    pub wlan_ip: Option<String>,
+}
+
+const INFO_COMMAND: &str = "echo sn=$(getprop ro.serialno); echo port=$(getprop service.adb.tls.port);                             echo model=$(getprop ro.product.model); ip -o -4 addr show";
+
+pub fn parse_phone_info(text: &str) -> PhoneInfo {
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(key))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    PhoneInfo {
+        serialno: field("sn=").unwrap_or_default(),
+        model: field("model="),
+        tls_port: field("port=").and_then(|p| p.parse().ok()).filter(|&p| p != 0),
+        wlan_ip: parse_wlan_ip(text),
+    }
+}
+
 /// Whether `adb connect` output means it connected.
-fn connect_succeeded(text: &str) -> bool {
+pub fn connect_succeeded(text: &str) -> bool {
     let t = text.trim();
     t.starts_with("connected to") || t.starts_with("already connected to")
 }
@@ -91,7 +125,7 @@ pub fn is_mdns_serial(serial: &str) -> bool {
     serial.contains("._adb-tls-connect._tcp")
 }
 
-fn is_ip_port(serial: &str) -> bool {
+pub fn is_ip_port(serial: &str) -> bool {
     serial.rsplit_once(':').is_some_and(|(host, port)| {
         port.parse::<u16>().is_ok()
             && host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok()
@@ -219,7 +253,7 @@ impl Adb {
         Ok(Output { success: status.success(), text })
     }
 
-    fn note(&self, line: String) {
+    pub fn note(&self, line: String) {
         if let Some(log) = &self.log {
             log(line);
         }
@@ -285,13 +319,17 @@ impl Adb {
     }
 
     /// Runs a shell command on a device and returns its trimmed output.
-    fn shell(&self, serial: &str, command: &str) -> Result<String, String> {
+    pub fn shell(&self, serial: &str, command: &str) -> Result<String, String> {
         let out = self.run(&["-s", serial, "shell", command], Duration::from_secs(10))?;
         if out.success {
             Ok(out.text.trim().to_string())
         } else {
             Err(out.text.trim().to_string())
         }
+    }
+
+    pub fn phone_info(&self, serial: &str) -> Result<PhoneInfo, String> {
+        Ok(parse_phone_info(&self.shell(serial, INFO_COMMAND)?))
     }
 
     /// Moves a USB-connected phone to Wi-Fi without a QR code, since it
@@ -500,7 +538,7 @@ fn hide_console(command: &mut Command) {
 }
 
 /// Runs a helper program (netstat, taskkill, ...) and returns its stdout.
-fn capture(program: &str, args: &[&str]) -> Result<String, String> {
+pub fn capture(program: &str, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(program);
     hide_console(&mut command);
     let out = command
@@ -770,6 +808,35 @@ mod tests {
         assert!(connect_succeeded("already connected to 192.168.1.29:5555"));
         assert!(!connect_succeeded("failed to connect to 192.168.1.29:5555"));
         assert!(!connect_succeeded("cannot connect to 192.168.1.29:5555: No route to host"));
+    }
+
+    #[test]
+    fn instance_serials() {
+        assert_eq!(serial_of_instance("adb-R5CT1234-AbCdEf"), Some("R5CT1234"));
+        assert_eq!(serial_of_instance("adb-10DECH0FCF00037-8FlQmV"), Some("10DECH0FCF00037"));
+        assert_eq!(serial_of_instance("adb-R5CT1234"), None);
+        assert_eq!(serial_of_instance("adbqr-abc-def"), None);
+    }
+
+    #[test]
+    fn phone_info() {
+        let text = "sn=R9RYC00849A
+port=37891
+model=SM-A075F
+                    1: lo    inet 127.0.0.1/8 scope host lo
+                    53: wlan0    inet 192.168.1.29/24 brd 192.168.1.255 scope global wlan0
+";
+        let i = parse_phone_info(text);
+        assert_eq!(i.serialno, "R9RYC00849A");
+        assert_eq!(i.tls_port, Some(37891));
+        assert_eq!(i.model.as_deref(), Some("SM-A075F"));
+        assert_eq!(i.wlan_ip.as_deref(), Some("192.168.1.29"));
+        let off = parse_phone_info("sn=X
+port=
+model=
+");
+        assert_eq!(off, PhoneInfo { serialno: "X".into(), ..PhoneInfo::default() });
+        assert_eq!(parse_phone_info("port=0").tls_port, None);
     }
 
     #[test]

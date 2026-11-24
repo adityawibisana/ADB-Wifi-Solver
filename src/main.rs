@@ -3,6 +3,10 @@
 
 mod adb;
 mod app;
+mod finder;
+mod history;
+mod mdns;
+mod net;
 mod pairing;
 mod qr;
 
@@ -36,6 +40,9 @@ fn main() {
             app::disconnect,
             app::reconnect,
             app::switch_to_wifi,
+            app::find_device,
+            app::forget_device,
+            app::set_auto_reconnect,
             app::restart_server,
             app::refresh,
             app::dismiss_notice,

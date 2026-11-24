@@ -3,21 +3,33 @@
 //! and refetches it whenever a `changed` event arrives.
 
 use crate::adb::{self, Adb, Device, Logger, MdnsService};
+use crate::finder::{self, Target};
+use crate::history::{self, Observation, Store};
+use crate::net::{self, Network};
 use crate::pairing::{Session, MAX_ATTEMPTS};
 use crate::qr;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const DEVICE_POLL: Duration = Duration::from_secs(2);
 const LOG_LINES: usize = 1000;
 /// At most one `changed` event per this interval; the window refetches on each.
 const EMIT_INTERVAL: Duration = Duration::from_millis(40);
+/// How often to re-read a connected phone's address for the history.
+const OBSERVE_EVERY: Duration = Duration::from_secs(60);
+/// How often to check the network and try reconnecting paired phones.
+const WATCH_EVERY: Duration = Duration::from_secs(10);
+/// Waits between automatic tries for a phone that wasn't found, doubling up to the maximum.
+const RETRY_FIRST: Duration = Duration::from_secs(20);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+const MDNS_SUFFIX: &str = "._adb-tls-connect._tcp";
 
 #[derive(Default)]
 struct DeviceList {
@@ -62,6 +74,18 @@ pub struct Shared {
     dirty: Mutex<bool>,
     dirty_cv: Condvar,
     qr_shown: AtomicBool,
+    /// Phones connected over Wi-Fi before, and where.
+    history: Mutex<Store>,
+    history_path: Mutex<Option<PathBuf>>,
+    /// Serial numbers of phones in adb's own pairing list.
+    paired: Mutex<HashSet<String>>,
+    /// adb serial -> when its details were last read, and its serial number.
+    observed: Mutex<HashMap<String, (Instant, String)>>,
+    /// What a search for a paired phone is doing, by serial number.
+    finding: Mutex<HashMap<String, String>>,
+    network: Mutex<Option<Network>>,
+    /// Serial number -> when to try reconnecting it automatically next, and the wait after that.
+    retry: Mutex<HashMap<String, (Instant, Duration)>>,
 }
 
 impl Shared {
@@ -83,14 +107,23 @@ impl Shared {
             dirty: Mutex::new(false),
             dirty_cv: Condvar::new(),
             qr_shown: AtomicBool::new(false),
+            history: Mutex::default(),
+            history_path: Mutex::default(),
+            paired: Mutex::default(),
+            observed: Mutex::default(),
+            finding: Mutex::default(),
+            network: Mutex::default(),
+            retry: Mutex::default(),
         })
     }
 
     /// Finds adb, starts the background threads and shows the first QR code.
     pub fn start(self: &Arc<Self>) {
         self.log(format!("startup: window created ({} ms)", crate::ms_since_launch()));
+        self.load_history();
         spawn_emitter(self.clone());
         spawn_device_poller(self.clone());
+        spawn_watcher(self.clone());
         let _ = self.set_adb(None);
         self.log(format!("startup: adb located ({} ms)", crate::ms_since_launch()));
         // Show a QR code right away; most of the time that's why the app was opened.
@@ -215,6 +248,250 @@ impl Shared {
         });
     }
 
+    fn load_history(&self) {
+        let path = self.handle.path().app_config_dir().ok().map(|d| d.join("devices.json"));
+        if let Some(p) = &path {
+            let store = Store::load(p);
+            self.log(format!("history: {} known phone(s) in {}", store.devices.len(), p.display()));
+            *self.history.lock().unwrap() = store;
+        }
+        *self.history_path.lock().unwrap() = path;
+    }
+
+    fn save_history(&self) {
+        let Some(path) = self.history_path.lock().unwrap().clone() else { return };
+        let result = self.history.lock().unwrap().save(&path);
+        if let Err(e) = result {
+            self.log(format!("history: could not save {}: {e}", path.display()));
+        }
+    }
+
+    /// Adds phones from adb's pairing list to the history.
+    fn sync_paired(&self) {
+        let guids = history::paired_guids();
+        let serials: HashSet<String> =
+            guids.iter().filter_map(|g| adb::serial_of_instance(g)).map(str::to_string).collect();
+        *self.paired.lock().unwrap() = serials;
+        let added = self.history.lock().unwrap().add_paired(&guids);
+        if added {
+            self.save_history();
+            self.changed();
+        }
+    }
+
+    /// The serial number of a device by its adb serial, if known.
+    fn serialno_of(&self, serial: &str) -> Option<String> {
+        if let Some(i) = serial.strip_suffix(MDNS_SUFFIX) {
+            return adb::serial_of_instance(i).map(str::to_string);
+        }
+        if let Some((_, sn)) = self.observed.lock().unwrap().get(serial) {
+            if !sn.is_empty() {
+                return Some(sn.clone());
+            }
+        }
+        if adb::is_ip_port(serial) {
+            return self.history.lock().unwrap().by_addr(serial).map(|k| k.serialno.clone());
+        }
+        Some(serial.to_string()) // USB serials are the serial number
+    }
+
+    /// Serial numbers of phones adb is connected to, or sees over mDNS.
+    fn present(&self, list: &DeviceList) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for d in &list.devices {
+            if d.is_usb() || d.state == "device" {
+                out.extend(self.serialno_of(&d.serial));
+            }
+        }
+        for s in &list.available {
+            out.extend(adb::serial_of_instance(&s.instance).map(str::to_string));
+        }
+        out
+    }
+
+    /// Records where the phones connected over Wi-Fi are, to find them again later.
+    fn observe(&self, adb: &Adb, devices: &[Device], services: &[MdnsService]) {
+        if !devices.iter().any(|d| d.is_wireless() && d.state == "device") {
+            return;
+        }
+        // The watcher may not have looked yet, right after startup.
+        if self.network.lock().unwrap().is_none() {
+            self.check_network();
+        }
+        let network = self.network.lock().unwrap().as_ref().map(|n| n.id.clone());
+        let mut arp: Option<Vec<_>> = None;
+        let mut changed = false;
+        for d in devices.iter().filter(|d| d.is_wireless() && d.state == "device") {
+            let due = self.observed.lock().unwrap().get(&d.serial).is_none_or(|(t, _)| t.elapsed() > OBSERVE_EVERY);
+            if !due {
+                continue;
+            }
+            let info = match adb.phone_info(&d.serial) {
+                Ok(i) if !i.serialno.is_empty() => i,
+                _ => {
+                    // Try again next round, not on every poll.
+                    let sn = self.serialno_of(&d.serial).unwrap_or_default();
+                    self.observed.lock().unwrap().insert(d.serial.clone(), (Instant::now(), sn));
+                    continue;
+                }
+            };
+            let mut guid = d.serial.strip_suffix(MDNS_SUFFIX).map(str::to_string);
+            let (addr, tcpip) = if adb::is_ip_port(&d.serial) {
+                if guid.is_none() {
+                    guid = services.iter().find(|s| s.addr == d.serial).map(|s| s.instance.clone());
+                }
+                let port = d.serial.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+                (Some(d.serial.clone()), port != info.tls_port)
+            } else {
+                // Listed by mDNS name: its service's address, else its Wi-Fi IP and Wireless debugging port.
+                let from_mdns = services
+                    .iter()
+                    .find(|s| Some(&s.instance) == guid.as_ref() && s.addr.parse::<SocketAddrV4>().is_ok())
+                    .map(|s| s.addr.clone());
+                let from_phone = match (&info.wlan_ip, info.tls_port) {
+                    (Some(ip), Some(port)) => Some(format!("{ip}:{port}")),
+                    _ => None,
+                };
+                (from_mdns.or(from_phone), false)
+            };
+            let mac = addr
+                .as_deref()
+                .and_then(|a| a.parse::<SocketAddrV4>().ok())
+                .and_then(|a| net::mac_of(*a.ip(), arp.get_or_insert_with(net::arp_table)));
+            self.observed.lock().unwrap().insert(d.serial.clone(), (Instant::now(), info.serialno.clone()));
+            self.retry.lock().unwrap().remove(&info.serialno);
+            let o = Observation {
+                serialno: info.serialno,
+                guid,
+                model: info.model.or_else(|| d.model.clone()),
+                addr,
+                tcpip,
+                mac,
+                network: network.clone(),
+            };
+            self.history.lock().unwrap().observe(o, history::now());
+            changed = true;
+        }
+        if changed {
+            self.save_history();
+            self.changed();
+        }
+    }
+
+    /// Notices when this PC moves to another network.
+    fn check_network(&self) {
+        let now = net::current_network();
+        let mut cur = self.network.lock().unwrap();
+        if *cur != now {
+            let text = now.as_ref().map_or("none".to_string(), |n| n.id.clone());
+            *cur = now;
+            drop(cur);
+            self.log(format!("network: {text}"));
+            // New network, new chances: try every phone again right away.
+            self.retry.lock().unwrap().clear();
+            self.changed();
+        }
+    }
+
+    fn target(&self, serialno: &str) -> Option<Target> {
+        let h = self.history.lock().unwrap();
+        let k = h.get(serialno)?;
+        Some(Target { serialno: k.serialno.clone(), guid: k.guid.clone(), addr: k.addr.clone(), mac: k.mac.clone() })
+    }
+
+    /// Quietly tries to reconnect phones last seen on this network that
+    /// aren't connected, waiting longer between tries for ones not found.
+    fn auto_reconnect(&self) {
+        let Some(adb) = self.adb() else { return };
+        let Some(network) = self.network.lock().unwrap().clone() else { return };
+        let present = {
+            let list = self.devices.lock().unwrap();
+            if !list.loaded || list.error.is_some() {
+                return;
+            }
+            self.present(&list)
+        };
+        let candidates: Vec<String> = {
+            let h = self.history.lock().unwrap();
+            if !h.auto_reconnect {
+                return;
+            }
+            h.devices
+                .iter()
+                .filter(|k| {
+                    k.network.as_deref() == Some(network.id.as_str())
+                        && !k.paused
+                        && k.addr.is_some()
+                        && !present.contains(&k.serialno)
+                })
+                .map(|k| k.serialno.clone())
+                .collect()
+        };
+        for serialno in candidates {
+            let due = self.retry.lock().unwrap().get(&serialno).is_none_or(|(at, _)| Instant::now() >= *at);
+            if !due || self.finding.lock().unwrap().contains_key(&serialno) {
+                continue;
+            }
+            let Some(target) = self.target(&serialno) else { continue };
+            self.finding.lock().unwrap().insert(serialno.clone(), "Reconnecting automatically...".into());
+            self.changed();
+            let result = finder::find(&adb, &target, false, network.local, &|_| {});
+            self.finding.lock().unwrap().remove(&serialno);
+            match result {
+                Ok(f) => {
+                    self.log(format!("auto-reconnect: connected {serialno} {} ({})", f.how, f.serial));
+                    self.retry.lock().unwrap().remove(&serialno);
+                }
+                Err(_) => {
+                    let mut retry = self.retry.lock().unwrap();
+                    let wait = retry.get(&serialno).map_or(RETRY_FIRST, |(_, w)| (*w * 2).min(RETRY_MAX));
+                    retry.insert(serialno, (Instant::now() + wait, wait));
+                }
+            }
+            self.refresh();
+            self.changed();
+        }
+    }
+
+    /// Searches for a phone connected before, port scan included, and shows the result.
+    fn find_device(self: &Arc<Self>, serialno: String) {
+        let Some(adb) = self.adb() else { return };
+        let Some(target) = self.target(&serialno) else { return };
+        {
+            let mut finding = self.finding.lock().unwrap();
+            if finding.contains_key(&serialno) {
+                return;
+            }
+            finding.insert(serialno.clone(), "Starting...".into());
+        }
+        *self.notice.lock().unwrap() = None;
+        self.history.lock().unwrap().set_paused(&serialno, false);
+        self.changed();
+        let shared = self.clone();
+        thread::spawn(move || {
+            let local = shared.network.lock().unwrap().as_ref().and_then(|n| n.local);
+            let status = |text: &str| {
+                shared.finding.lock().unwrap().insert(serialno.clone(), text.to_string());
+                shared.changed();
+            };
+            let result = finder::find(&adb, &target, true, local, &status);
+            shared.finding.lock().unwrap().remove(&serialno);
+            let model = shared.history.lock().unwrap().get(&serialno).and_then(|k| k.model.clone());
+            let name = model.unwrap_or_else(|| serialno.clone());
+            let notice = match result {
+                Ok(f) => {
+                    shared.retry.lock().unwrap().remove(&serialno);
+                    (format!("Reconnected {name} {} ({})", f.how, f.serial), false)
+                }
+                Err(e) => (e, true),
+            };
+            *shared.notice.lock().unwrap() = Some(notice);
+            shared.save_history();
+            shared.refresh();
+            shared.changed();
+        });
+    }
+
     fn snapshot(&self) -> Snapshot {
         let (adb_path, adb_error) = match &*self.adb.lock().unwrap() {
             Ok(adb) => (Some(adb.path().display().to_string()), None),
@@ -285,13 +562,39 @@ impl Shared {
                 .collect(),
             other_count: other.len(),
             notice: self.notice.lock().unwrap().as_ref().map(notice_dto),
+            known: Vec::new(),
+            auto_reconnect: false,
         };
         let server = ServerDto {
             hung: list.server_hung,
             restarting: self.restarting.load(Ordering::Relaxed),
             notice: self.restart_notice.lock().unwrap().as_ref().map(notice_dto),
         };
+        let present = (list.loaded && list.error.is_none()).then(|| self.present(&list));
         drop(list);
+
+        let network = self.network.lock().unwrap().as_ref().map(|n| n.id.clone());
+        let finding = self.finding.lock().unwrap().clone();
+        let paired = self.paired.lock().unwrap().clone();
+        let h = self.history.lock().unwrap();
+        let mut known: Vec<KnownDto> = h
+            .devices
+            .iter()
+            .filter(|k| present.as_ref().is_some_and(|p| !p.contains(&k.serialno)))
+            .map(|k| KnownDto {
+                serialno: k.serialno.clone(),
+                model: k.model.clone(),
+                addr: k.addr.clone(),
+                last_seen: k.last_seen,
+                other_network: k.network.is_some() && network.is_some() && k.network != network,
+                paired: paired.contains(&k.serialno),
+                paused: k.paused,
+                progress: finding.get(&k.serialno).cloned(),
+            })
+            .collect();
+        known.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then_with(|| a.serialno.cmp(&b.serialno)));
+        let devices = DevicesDto { known, auto_reconnect: h.auto_reconnect, ..devices };
+        drop(h);
 
         Snapshot {
             adb_path,
@@ -352,6 +655,27 @@ struct DevicesDto {
     /// Emulators, which aren't listed.
     other_count: usize,
     notice: Option<NoticeDto>,
+    /// Phones connected before that adb isn't connected to and doesn't see now.
+    known: Vec<KnownDto>,
+    auto_reconnect: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnownDto {
+    serialno: String,
+    model: Option<String>,
+    addr: Option<String>,
+    /// Unix seconds; 0 if adbqr never saw it connected.
+    last_seen: u64,
+    /// Last seen on a network other than this PC's.
+    other_network: bool,
+    /// In adb's own pairing list.
+    paired: bool,
+    /// Disconnected from adbqr, so not reconnected automatically.
+    paused: bool,
+    /// What a search for it is doing.
+    progress: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -453,6 +777,16 @@ pub fn cancel_pairing(shared: S) {
 
 #[tauri::command]
 pub fn disconnect(shared: S, serials: Vec<String>) {
+    // Disconnected on purpose: don't reconnect it automatically.
+    let mut paused = false;
+    for serial in &serials {
+        if let Some(sn) = shared.serialno_of(serial) {
+            paused |= shared.history.lock().unwrap().set_paused(&sn, true);
+        }
+    }
+    if paused {
+        shared.save_history();
+    }
     shared.run_each(serials, |adb, serial| {
         adb.disconnect(serial).map_err(|e| format!("Could not disconnect {serial}: {e}"))
     });
@@ -478,6 +812,28 @@ pub fn switch_to_wifi(shared: S, serials: Vec<String>) {
         s.switched.lock().unwrap().insert(serial.to_string(), addr);
         Ok(msg)
     });
+}
+
+/// Looks for a phone connected before and reconnects it, without a QR code.
+#[tauri::command]
+pub fn find_device(shared: S, serialno: String) {
+    shared.find_device(serialno);
+}
+
+/// Removes a phone from the list of phones connected before.
+#[tauri::command]
+pub fn forget_device(shared: S, serialno: String) {
+    shared.history.lock().unwrap().forget(&serialno);
+    shared.save_history();
+    shared.changed();
+}
+
+#[tauri::command]
+pub fn set_auto_reconnect(shared: S, on: bool) {
+    shared.history.lock().unwrap().auto_reconnect = on;
+    shared.retry.lock().unwrap().clear();
+    shared.save_history();
+    shared.changed();
 }
 
 #[tauri::command]
@@ -530,6 +886,9 @@ fn spawn_device_poller(shared: Arc<Shared>) {
             }
             // No point asking a server that just failed to answer.
             let services = if result.is_ok() { adb.mdns_services().unwrap_or_default() } else { Vec::new() };
+            if let Ok(devices) = &result {
+                shared.observe(&adb, devices, &services);
+            }
             let mut list = shared.devices.lock().unwrap();
             match result {
                 Ok(devices) => {
@@ -551,5 +910,16 @@ fn spawn_device_poller(shared: Arc<Shared>) {
         while start.elapsed() < DEVICE_POLL && !shared.refresh_now.swap(false, Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
         }
+    });
+}
+
+/// Every few seconds: notices network changes, picks up newly paired phones
+/// and tries to reconnect phones that dropped off.
+fn spawn_watcher(shared: Arc<Shared>) {
+    thread::spawn(move || loop {
+        shared.check_network();
+        shared.sync_paired();
+        shared.auto_reconnect();
+        thread::sleep(WATCH_EVERY);
     });
 }

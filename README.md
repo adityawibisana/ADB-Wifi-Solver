@@ -29,6 +29,24 @@ Pairing is kept, so a phone only needs the QR code once per PC. Under **Availabl
 
 A phone with Wireless debugging off can't be reached from the PC. That includes phones disconnected by turning it off, and phones that changed Wi-Fi network or rebooted, since Android turns it off then. Turn it back on in Developer options, and the phone shows up under **Available on Wi-Fi** (or adb reconnects it on its own).
 
+### Paired phones that don't show up
+
+Sometimes mDNS doesn't work (a firewall, a router that filters multicast, adb's mDNS acting up), and a paired phone with Wireless debugging on never appears under **Available on Wi-Fi**. For those, adbqr remembers every phone it has seen connected over Wi-Fi: its address, its Wi-Fi MAC address, and which network it was on (told apart by the router's MAC address). It also lists phones from adb's own pairing list (`~/.android/adb_known_hosts.pb`).
+
+Phones that aren't connected or available are listed under **Paired before**. **Find** looks for one and connects to it, trying in turn:
+
+1. its last address;
+2. asking for it over mDNS directly, both to the multicast group and straight to its last IP, which works on many networks where adb's mDNS doesn't;
+3. its MAC address in the PC's ARP table, after a quick sweep of the subnet, in case it got a new IP;
+4. port 5555, in case it was switched with `adb tcpip`;
+5. scanning its IP for Wireless debugging's port, which changes each time Wireless debugging is turned on. This takes up to about 15 seconds.
+
+Each port is checked with an adb handshake first, so `adb connect` only runs against a real adb. Nothing shows on the phone, and it still has to be paired with this PC: a phone that isn't refuses the connection.
+
+With **Reconnect paired phones automatically** on (the default), adbqr also tries steps 1–3 in the background for phones last seen on the network the PC is on now, waiting longer between tries for a phone that isn't found (up to 5 minutes). It doesn't port-scan on its own, and leaves alone phones you disconnected until they connect again some other way.
+
+The list is kept in `devices.json` in the app's config folder (`%APPDATA%\io.github.adityawibisana.adbqr` on Windows). The **×** next to a phone forgets it; the phone stays paired.
+
 ### Switching a USB phone to Wi-Fi
 
 A phone plugged in with a USB cable, with USB debugging allowed, is listed under **Connected over USB**. **Switch to Wi-Fi** connects it over Wi-Fi without a QR code, because it already trusts this PC over USB. When it's done, the phone is listed under **Connected over Wi-Fi**, its USB row shows **On Wi-Fi**, and you can unplug the cable. The phone must be connected to the same Wi-Fi network as the PC.
@@ -78,6 +96,7 @@ The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). No Node.js o
 
 - **Nothing happens after scanning.** Pairing is found over mDNS (UDP 5353). Make sure your firewall allows adb on this network. On Windows, the network should be set to *Private*.
 - **"mDNS is unavailable" warning.** Update platform-tools.
+- **Find can't find a paired phone.** Check that Wireless debugging is on and the phone is on the same Wi-Fi as the PC. Guest networks and some office networks stop devices from reaching each other, and then nothing on the PC can reach the phone.
 - **A disconnected phone comes back.** For phones listed by mDNS name, Disconnect turns off Wireless debugging; if it's turned back on, adb reconnects. Check the adb log for what happened.
 - **"The adb server isn't responding."** The adb server stopped answering, so every adb command hangs, including those from Android Studio. Click **Restart adb server**: it runs `adb kill-server`, force-kills the server process if that doesn't work, and starts a new one. Other adb tools reconnect on their own.
 - **Something else.** Open **Show adb log** to see every adb command and what it printed.
@@ -88,6 +107,8 @@ The app ends up in `target/release/adbqr` (`adbqr.exe` on Windows). No Node.js o
 2. After the scan, the phone advertises an `_adb-tls-pairing` mDNS service under that name. adbqr waits for it to appear in `adb mdns services`.
 3. Runs `adb pair <addr> <password>`.
 4. Waits for the phone's `_adb-tls-connect` service and runs `adb connect` if adb doesn't connect on its own.
+
+Finding paired phones without adb's mDNS is in [`src/finder.rs`](src/finder.rs), with the mDNS client in [`src/mdns.rs`](src/mdns.rs), the ARP, gateway and port-scan helpers in [`src/net.rs`](src/net.rs), and the remembered phones in [`src/history.rs`](src/history.rs).
 
 The window is built with [Tauri](https://tauri.app). The Rust side ([`src/`](src)) runs adb and does the pairing; the page in [`ui/`](ui) fetches the app's state from it and redraws whenever it changes.
 

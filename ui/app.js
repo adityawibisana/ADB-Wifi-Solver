@@ -229,6 +229,7 @@ function renderDevices() {
     d.wireless = [];
     d.available = [];
     d.usb = [];
+    d.known = [];
     d.otherCount = 0;
   }
   const count = $("count");
@@ -245,7 +246,12 @@ function renderDevices() {
   } else if (!d.loaded) {
     list = `<div class="empty"><span class="spinner"></span><span>Looking for devices...</span></div>`;
   } else if (!d.wireless.length && !d.available.length) {
-    list = `<div class="empty">${icons.wifiOff}<span>No devices connected over Wi-Fi.${d.usb.length ? " A phone on USB can be switched to Wi-Fi below." : ""}</span></div>`;
+    const hint = d.known.length
+      ? " Phones paired before are listed below; Find reconnects one without a QR code."
+      : d.usb.length
+        ? " A phone on USB can be switched to Wi-Fi below."
+        : "";
+    list = `<div class="empty">${icons.wifiOff}<span>No devices connected over Wi-Fi.${hint}</span></div>`;
   }
 
   if (usable) {
@@ -276,6 +282,29 @@ function renderDevices() {
             <div class="device-serial">${esc(s.addr)}</div>
           </div>
           ${s.busy ? '<span class="spinner"></span>' : `<button class="btn small" data-action="reconnect" data-target="${esc(s.addr)}" title="Runs adb connect for this address. Works without a QR code if the phone was paired with this PC before.">Reconnect</button>`}
+        </div>`;
+      }
+    }
+    if (d.known.length) {
+      list += `<div class="section-label" title="Phones paired with this PC that adb isn't connected to and doesn't see on the network right now.">Paired before</div>`;
+      for (const k of d.known) {
+        const findTip =
+          "Looks for the phone and connects to it without a QR code: at its last address, over mDNS, by its MAC address if its IP changed, " +
+          "then by scanning its IP for Wireless debugging's new port (takes up to 15 seconds). Wireless debugging must be on.";
+        const action = k.progress
+          ? '<span class="spinner"></span>'
+          : `<button class="btn small" data-action="find" data-target="${esc(k.serialno)}" title="${esc(findTip)}">Find</button>
+             <button class="icon-btn" data-action="forget" data-target="${esc(k.serialno)}" title="Forget this phone. It stays paired; it comes back here when it connects again.">${icons.x}</button>`;
+        const tag = k.paused
+          ? `<span class="tag" title="You disconnected it, so it isn't reconnected automatically. Find reconnects it.">Disconnected</span>`
+          : "";
+        list += `<div class="device">
+          <div class="device-icon">${icons.phone}<span class="dot off"></span></div>
+          <div class="device-info">
+            <div class="device-name" title="${esc(k.serialno)}">${esc(k.model || k.serialno)}${tag}</div>
+            <div class="device-serial" title="${esc(k.progress || knownDetail(k))}">${esc(k.progress || knownDetail(k))}</div>
+          </div>
+          ${action}
         </div>`;
       }
     }
@@ -317,11 +346,32 @@ function renderDevices() {
   if (d.wireless.length > 1) {
     foot += `<button class="btn danger" data-action="disconnect-all" ${idle.length ? "" : "disabled"}>Disconnect all</button>`;
   }
+  if (usable && (d.known.length || d.wireless.length)) {
+    foot += `<label class="field check" title="Every few seconds, tries to reconnect paired phones last seen on this network that dropped off, at their last address and over mDNS. Phones you disconnect are left alone.">
+      <input type="checkbox" data-change="auto-reconnect" ${d.autoReconnect ? "checked" : ""}> Reconnect paired phones automatically</label>`;
+  }
   if (d.otherCount > 0) {
     foot += `<div class="note">${d.otherCount} emulator${d.otherCount === 1 ? "" : "s"} not shown.</div>`;
   }
 
   put($("devices"), `<div class="device-scroll">${list}</div><div class="devices-foot">${foot}</div>`);
+}
+
+/** "192.168.1.20:37891 · 3 h ago", or why there's no address. */
+function knownDetail(k) {
+  if (!k.lastSeen) return k.paired ? "Paired; no address yet" : k.serialno;
+  const parts = [];
+  if (k.addr) parts.push(k.addr);
+  parts.push(k.otherNetwork ? `on another network, ${ago(k.lastSeen)}` : ago(k.lastSeen));
+  return parts.join(" · ");
+}
+
+function ago(unixSecs) {
+  const s = Math.max(0, Date.now() / 1000 - unixSecs);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
 }
 
 /** `adb-R52W70XYZ12-Qm8kLp` (mDNS instance) -> `R52W70XYZ12` (the phone's serial). */
@@ -398,6 +448,12 @@ document.addEventListener("click", async (e) => {
     case "switch-wifi":
       await invoke("switch_to_wifi", { serials: [target] });
       break;
+    case "find":
+      await invoke("find_device", { serialno: target });
+      break;
+    case "forget":
+      await invoke("forget_device", { serialno: target });
+      break;
     case "refresh":
       el.classList.remove("spin");
       void el.offsetWidth;
@@ -434,8 +490,12 @@ document.addEventListener("click", async (e) => {
   pull();
 });
 
-document.addEventListener("change", (e) => {
+document.addEventListener("change", async (e) => {
   if (e.target.id === "timeout") readTimeout();
+  if (e.target.dataset.change === "auto-reconnect") {
+    await invoke("set_auto_reconnect", { on: e.target.checked });
+    pull();
+  }
 });
 
 function render() {
