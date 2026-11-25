@@ -1,6 +1,6 @@
 [package]
 name = "adbqr"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Desktop app: scan a QR code on an Android phone to pair and connect ADB over Wi-Fi, and disconnect Wi-Fi devices."
 license = "MIT"

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.0 - 2026-11-25
+
+- Show phones by the name they're sold as, with model and Android version (408eb91)
+- Add firewall help and recover from adb's stuck mDNS (c55bcb9)
+- Find and reconnect paired phones that mDNS doesn't show (d44f097)
+
 ## v0.4.0 - 2026-11-24
 
 - Update screenshots for the Devices panel and USB switch (b48200c)
